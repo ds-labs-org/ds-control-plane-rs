@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: Format, lint, and test (fast, no Docker)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # `#[ignore]`d by default (crates/control-plane-http/tests/dsp_tck.rs)
+      # so this stays fast and never needs Docker — that test has its own
+      # job below.
+      - name: Run tests
+        run: cargo test --workspace
+
+  dsp-tck:
+    name: Dataspace Protocol TCK (provider-role bootstrap scope)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # GitHub-hosted ubuntu-latest runners have Docker preinstalled;
+      # `testcontainers` (crates/control-plane-http/tests/dsp_tck.rs) drives
+      # it directly to pull and run the real, official
+      # eclipsedataspacetck/dsp-tck-runtime:latest image against a real,
+      # in-process instance of this control plane — no mock, no
+      # reimplementation of the TCK's own assertions.
+      #
+      # This does NOT claim full DSP TCK conformance: this control plane is
+      # a bootstrap, provider-role only, with an always-allow stub policy
+      # and no automatic negotiation/transfer progression logic (see
+      # ../ARCHITECTURE.md, "Scope" and "TCK conformance snapshot"). The
+      # test asserts the exact, already-documented set of TCK failures that
+      # scope implies — see crates/control-plane-http/tests/dsp_tck.rs —
+      # so this job still gates merges: a real regression, or the TCK
+      # reporting a different failure set than documented, fails it.
+      - name: Run the Dataspace Protocol TCK conformance test
+        run: cargo test -p control-plane-http --test dsp_tck -- --ignored --nocapture

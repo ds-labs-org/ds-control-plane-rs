@@ -1,0 +1,36 @@
+[package]
+name = "control-plane-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "ds-control-plane-rs"
+path = "src/main.rs"
+
+[dependencies]
+control-plane-core = { path = "../control-plane-core" }
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+# Runs the real `eclipsedataspacetck/dsp-tck-runtime` container in
+# tests/dsp_tck.rs, same crate this project's sibling ds-sql-dps-rs uses for
+# the analogous DPS TCK test.
+testcontainers = "0.26"
+# `LogConsumer::accept` returns a `BoxFuture`; the TCK container's own
+# process exit code is always 0 regardless of test outcome, so its stdout
+# has to be watched for failure lines instead (see tests/dsp_tck.rs).
+futures = "0.3"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
