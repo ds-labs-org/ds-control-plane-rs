@@ -139,7 +139,8 @@ upstream commit, so all three connectors are directly comparable.
 and a workspace member that inherits `version`/`edition` from the root
 `Cargo.toml`, as its manifest expects. Clone with
 `git clone --recurse-submodules`, or run `git submodule update --init`
-in an existing checkout; a CI checkout needs `submodules: true`.
+in an existing checkout; `.github/workflows/ci.yml` checks it out with
+`submodules: true`.
 
 **The store (`crates/control-plane-graph`):** one embedded Oxigraph store
 with two named graphs, split the way Contreforts' own `CONFIG_GRAPH`
