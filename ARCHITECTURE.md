@@ -83,6 +83,38 @@ side of a connector.
   `.../completion`, `.../termination`, `.../suspension`), same real
   state-machine-plus-error-body treatment.
 
+- **OID4VCI holder** (`crates/control-plane-oid4vci`,
+  `crates/control-plane-http/src/oid4vci.rs`): the connector acts as an
+  [OID4VCI 1.0](https://openid.net/specs/openid-4-verifiable-credential-issuance-1_0.html)
+  wallet for itself. Covered: Credential Offer by value and by reference;
+  issuer metadata at the 1.0 well-known location (inserted before the
+  path) with a fallback to the appended pre-1.0 location, and a check that
+  it names the offering issuer; RFC 8414 authorization server metadata
+  with an OpenID discovery fallback; Pre-Authorized Code token exchange
+  with `tx_code`; `credential_identifiers` from the token response used in
+  place of the configuration id, as the spec requires; Nonce Endpoint plus
+  `openid4vci-proof+jwt` ES256 key proofs carrying the holder's `jwk`, with
+  one retry on `invalid_nonce`; 1.0 request/response shapes (`proofs`,
+  `credentials[]`); deferred issuance; best-effort `credential_accepted`
+  notification. Exercised by `crates/control-plane-oid4vci/tests/mock_issuer.rs`
+  against an in-process issuer that verifies the proof signature, `typ`,
+  `aud` and `nonce`.
+
+  Not covered: the Authorization Code flow (needs a user-agent redirect a
+  headless control plane does not have), DPoP-bound tokens, client
+  authentication / wallet attestation, encrypted credential responses,
+  signed issuer metadata, and any validation of the issued credential
+  itself (it is stored as received). Received credentials and the holder
+  key live in memory unless `OID4VCI_HOLDER_JWK` pins the key.
+
+  Why an in-repo client instead of a library: surveyed on 2026-10-14,
+  `affinidi-openid4vci` still sends draft-13 request shapes (`format` +
+  singular `proof`) despite advertising 1.0; spruceid's `oid4vci-rs` is
+  1.0-correct but pulls in `ssi`, `isomdl` and an `oauth2` alpha and is
+  only on crates.io as a third-party fork; `reallyme-openid4vci-wallet` is
+  1.0-correct but two weeks old; impierce and credibil/vercre releases are
+  pre-1.0 drafts.
+
 ### Stubbed
 
 - **Policy**: always-allow. `POST .../negotiations/request` never rejects

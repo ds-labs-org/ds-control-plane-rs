@@ -11,6 +11,7 @@ pub mod catalog;
 pub mod config;
 pub mod metadata;
 pub mod negotiation;
+pub mod oid4vci;
 pub mod state;
 pub mod transfer;
 
@@ -99,6 +100,11 @@ pub async fn build(config: Config) -> anyhow::Result<App> {
             post(transfer::suspend_transfer),
         )
         .with_state(state);
+
+    let router = match oid4vci::router(oid4vci::Oid4vciConfig::from_env())? {
+        Some(management) => router.merge(management),
+        None => router,
+    };
 
     let addr = format!("0.0.0.0:{}", config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;

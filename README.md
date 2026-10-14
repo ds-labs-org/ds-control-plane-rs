@@ -46,6 +46,11 @@ a real, date-stamped Eclipse Dataspace TCK conformance snapshot.
 - **Policy**: an always-allow stub — no ODRL constraint evaluation.
 - **Consumer role**: out of scope for this pass (no consumer HTTP surface,
   no outbound negotiation/transfer initiation).
+- **OID4VCI holder**: the connector can obtain key-bound Verifiable
+  Credentials for itself from an
+  [OpenID for Verifiable Credential Issuance 1.0](https://openid.net/specs/openid-4-verifiable-credential-issuance-1_0.html)
+  issuer, using the Pre-Authorized Code flow, through an API-key-gated
+  management API. See "OID4VCI holder" below.
 
 ## Layout
 
@@ -55,8 +60,12 @@ crates/
                         the ContractNegotiation and TransferProcess state
                         machines, and their DSP wire message shapes.
   control-plane-http/   axum HTTP server exposing the real DSP endpoint
-                        paths, an in-memory store, and the
-                        `ds-control-plane-rs` binary.
+                        paths, an in-memory store, the OID4VCI holder
+                        management API, and the `ds-control-plane-rs` binary.
+  control-plane-oid4vci/ OID4VCI 1.0 holder client: offer parsing, issuer
+                        and authorization server metadata, pre-authorized
+                        code token exchange, nonce + ES256 key proofs,
+                        credential, deferred and notification endpoints.
     tests/dsp_tck.rs    Runs the real, official Eclipse Dataspace TCK
                         (`eclipsedataspacetck/dsp-tck-runtime`) against an
                         in-process instance of this server.
@@ -80,6 +89,33 @@ cargo run -p control-plane-http
 Configuration is via environment variables (`crates/control-plane-http/src/config.rs`):
 `PORT` (default `8080`), `AGENT_ID`, `BASE_URL`, `DSP_PATH` (default
 `/dsp/2025-1`).
+
+### OID4VCI holder
+
+Off unless `MANAGEMENT_API_KEY` is set; every route then requires it in
+`X-Api-Key` (these routes make outbound requests to issuer URLs taken from
+the offer, so they are never exposed unauthenticated).
+`OID4VCI_HOLDER_JWK` takes the holder's private P-256 key as an EC JWK;
+without it a key is generated at startup and lost on restart.
+
+```bash
+MANAGEMENT_API_KEY=secret cargo run -p control-plane-http
+
+# Accept an offer (offer URI, or the Credential Offer JSON object itself)
+curl -H 'X-Api-Key: secret' -H 'Content-Type: application/json' \
+  -d '{"offer": "openid-credential-offer://?credential_offer_uri=...", "tx_code": "1234"}' \
+  http://localhost:8080/management/oid4vci/offers
+
+curl -H 'X-Api-Key: secret' http://localhost:8080/management/oid4vci/credentials
+```
+
+| Route | Purpose |
+|---|---|
+| `GET /management/oid4vci/holder` | Holder public JWK and `did:jwk` |
+| `POST /management/oid4vci/offers` | Accept a Credential Offer (`offer`, optional `tx_code`, optional `credential_configuration_ids`) |
+| `GET /management/oid4vci/credentials[/{id}]` | Credentials received |
+| `GET /management/oid4vci/deferred` | Pending deferred issuances |
+| `POST /management/oid4vci/deferred/{id}` | Poll one deferred issuance (`202` pending, `200` issued) |
 
 ### Dataspace Protocol TCK conformance
 

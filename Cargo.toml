@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/control-plane-core", "crates/control-plane-http"]
+members = [
+    "crates/control-plane-core",
+    "crates/control-plane-http",
+    "crates/control-plane-oid4vci",
+]
 
 [workspace.package]
 version = "0.1.0"
