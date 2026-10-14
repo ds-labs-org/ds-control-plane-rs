@@ -104,6 +104,28 @@ fn read_dataset(r: &Reader<'_>, node: &NamedNode) -> Result<Dataset, GraphError>
     })
 }
 
+/// Refuses to write `node` as a `class` record when it is the settings
+/// node or already holds a record of another type: `replace` would
+/// otherwise silently delete that record.
+fn check_kind(r: &Reader<'_>, node: &NamedNode, class: &str) -> Result<(), GraphError> {
+    let conflict = |reason: String| GraphError::Conflict {
+        node: node.as_str().to_string(),
+        kind: class.to_string(),
+        reason,
+    };
+    if node.as_str() == SETTINGS_NODE {
+        return Err(conflict("it is the connector settings node".to_string()));
+    }
+    if let Some(other) = r
+        .types(node.as_ref().into())?
+        .into_iter()
+        .find(|t| t != class)
+    {
+        return Err(conflict(format!("it is already a <{other}>")));
+    }
+    Ok(())
+}
+
 impl ControlPlaneGraph {
     /// The stored connector settings, or `None` before any were written.
     pub fn settings(&self) -> Result<Option<ConnectorSettings>, GraphError> {
@@ -137,12 +159,12 @@ impl ControlPlaneGraph {
         w.add_str(node.clone(), dscp("dspPath"), &settings.dsp_path);
         w.add_str(node.clone(), dscp("catalogId"), &settings.catalog_id);
         let service = NamedNode::new(&settings.data_service_id)?;
+        check_kind(&self.reader(&graph), &service, &dcat("DataService"))?;
         w.add(node.clone(), dcat("service"), service.clone());
-        self.replace(&graph, &node, w.quads)?;
 
-        let mut w = Writer::new(&graph);
-        write_data_service(&mut w, &settings.data_service())?;
-        self.replace(&graph, &service, w.quads)
+        let mut sw = Writer::new(&graph);
+        write_data_service(&mut sw, &settings.data_service())?;
+        self.replace_all(&graph, vec![(node, w.quads), (service, sw.quads)])
     }
 
     /// The stored data service `id`, if any.
@@ -189,31 +211,42 @@ impl ControlPlaneGraph {
     }
 
     /// Adds `dataset` to the catalog, replacing a dataset with the same id.
-    /// The data services its distributions embed are written too.
+    /// The data services its distributions embed are written too, all in
+    /// one transaction. Fails with [`GraphError::Conflict`], writing
+    /// nothing, when the dataset id or a data service id names the settings
+    /// node or a record of another kind, or a data service id equals the
+    /// dataset's own.
     pub fn put_dataset(&self, dataset: &Dataset) -> Result<(), GraphError> {
         let _guard = self.write_lock.lock().expect("write lock poisoned");
         let graph = settings_graph();
         let node = NamedNode::new(&dataset.id)?;
+        let r = self.reader(&graph);
+        check_kind(&r, &node, &dcat("Dataset"))?;
         let mut w = Writer::new(&graph);
         w.add_type(node.clone(), dcat("Dataset"));
         for (i, offer) in dataset.has_policy.iter().enumerate() {
             write_offer(&mut w, node.clone(), odrl("hasPolicy"), i, offer);
         }
-        let mut services = Vec::new();
+        let mut records = Vec::new();
         for (i, d) in dataset.distribution.iter().enumerate() {
             let child = w.add_child(node.clone(), dcat("distribution"), i);
             w.add_type(child.clone(), dcat("Distribution"));
             w.add_str(child.clone(), dcterms("format"), &d.format);
             let mut sw = Writer::new(&graph);
             let service = write_data_service(&mut sw, &d.access_service)?;
+            if service == node {
+                return Err(GraphError::Conflict {
+                    node: service.as_str().to_string(),
+                    kind: dcat("DataService"),
+                    reason: "it is the dataset's own id".to_string(),
+                });
+            }
+            check_kind(&r, &service, &dcat("DataService"))?;
             w.add(child, dcat("accessService"), service.clone());
-            services.push((service, sw.quads));
+            records.push((service, sw.quads));
         }
-        self.replace(&graph, &node, w.quads)?;
-        for (service, quads) in services {
-            self.replace(&graph, &service, quads)?;
-        }
-        Ok(())
+        records.insert(0, (node, w.quads));
+        self.replace_all(&graph, records)
     }
 
     /// Removes the dataset `id` from the catalog. Returns whether it existed.

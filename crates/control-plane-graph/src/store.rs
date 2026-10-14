@@ -33,6 +33,15 @@ pub enum GraphError {
     Json(#[from] serde_json::Error),
     #[error("stored record {node} is missing required property <{property}>")]
     Missing { node: String, property: String },
+    /// A write would overwrite a node that already holds a different kind
+    /// of record (e.g. a dataset `@id` that names a data service or the
+    /// settings node). Nothing was written.
+    #[error("{node} cannot be written as a {kind}: {reason}")]
+    Conflict {
+        node: String,
+        kind: String,
+        reason: String,
+    },
     #[error("stored record {node} has an unreadable <{property}>: {value}")]
     Invalid {
         node: String,
@@ -86,13 +95,34 @@ impl ControlPlaneGraph {
         root: &NamedNode,
         quads: Vec<Quad>,
     ) -> Result<(), GraphError> {
-        let old = self.tree(graph, root.as_ref().into())?;
+        self.replace_all(graph, vec![(root.clone(), quads)])
+    }
+
+    /// [`Self::replace`] for several records in one transaction, so either
+    /// every record is rewritten or none is. When a root appears more than
+    /// once, its last entry wins.
+    pub(crate) fn replace_all(
+        &self,
+        graph: &NamedNode,
+        records: Vec<(NamedNode, Vec<Quad>)>,
+    ) -> Result<(), GraphError> {
+        let mut latest: Vec<(NamedNode, Vec<Quad>)> = Vec::new();
+        for (root, quads) in records {
+            latest.retain(|(r, _)| *r != root);
+            latest.push((root, quads));
+        }
+        let mut old = Vec::new();
+        for (root, _) in &latest {
+            old.extend(self.tree(graph, root.as_ref().into())?);
+        }
         let mut transaction = self.store.start_transaction()?;
         for quad in &old {
             transaction.remove(quad);
         }
-        for quad in &quads {
-            transaction.insert(quad);
+        for (_, quads) in &latest {
+            for quad in quads {
+                transaction.insert(quad);
+            }
         }
         transaction.commit()?;
         Ok(())
@@ -256,6 +286,21 @@ impl Reader<'_> {
             out.push(quad?.subject);
         }
         Ok(out)
+    }
+
+    /// Every `rdf:type` of `subject` that is a named class.
+    pub(crate) fn types(
+        &self,
+        subject: NamedOrBlankNodeRef<'_>,
+    ) -> Result<Vec<String>, GraphError> {
+        Ok(self
+            .objects(subject, &rdf("type"))?
+            .into_iter()
+            .filter_map(|t| match t {
+                Term::NamedNode(n) => Some(n.into_string()),
+                _ => None,
+            })
+            .collect())
     }
 
     pub(crate) fn has_type(

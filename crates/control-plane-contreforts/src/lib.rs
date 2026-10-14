@@ -36,9 +36,14 @@ pub const KINDS: [&str; 3] = [DATASET_KIND, NEGOTIATION_KIND, TRANSFER_KIND];
 
 const SOURCE: &str = "ds-control-plane-rs";
 
+/// A [`GraphError::Conflict`] is bad input (an id colliding with another
+/// record), so it is a `Config` error; anything else is a store failure.
 fn to_api_err(e: GraphError) -> ConnectorError {
-    ConnectorError::Api {
-        message: e.to_string(),
+    match e {
+        GraphError::Conflict { .. } => ConnectorError::Config(e.to_string()),
+        e => ConnectorError::Api {
+            message: e.to_string(),
+        },
     }
 }
 

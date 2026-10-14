@@ -176,6 +176,13 @@ found") matched with `quads_for_pattern`, and everything else a
 counterparty sends is a plain literal. Each write replaces a record's node
 and the blank nodes under it in one transaction, under a write lock, so
 `update_negotiation`/`update_transfer` are atomic read-modify-writes.
+Datasets, data services and the settings node share the settings graph, so
+`put_dataset` and `put_settings` first check that no IRI they are about to
+replace is the settings node or already typed as another kind of record
+(a dataset id naming a data service, an `accessService` naming a dataset or
+its own dataset): such a write fails with `GraphError::Conflict` (a
+`Config` error through Contreforts) and nothing is written. A dataset and
+its data services are replaced in one transaction.
 
 **Persistence:** set `GRAPH_STORE_PATH` (the variable Contreforts' own
 `GraphConfig` reads) to a directory and the store is RocksDB-backed:
