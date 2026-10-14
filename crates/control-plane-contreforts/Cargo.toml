@@ -1,0 +1,20 @@
+[package]
+name = "control-plane-contreforts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Implements Contreforts' ContrefortsConnector trait over control-plane-graph, so ds-control-plane-rs's catalog datasets, contract negotiations and transfer processes are reachable through Contreforts' generic connector interface."
+
+[dependencies]
+contreforts-core = { path = "../../vendor/contreforts-core" }
+control-plane-core = { path = "../control-plane-core" }
+control-plane-graph = { path = "../control-plane-graph", default-features = false }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+contreforts-declaration = { path = "../../vendor/contreforts-core/declaration" }
+tokio = { workspace = true }

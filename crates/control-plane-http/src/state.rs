@@ -1,84 +1,106 @@
-//! Shared application state: the in-memory catalog seed and the
-//! negotiation/transfer-process stores, both keyed by `providerPid` since
-//! this bootstrap only ever plays the Provider role.
+//! Shared application state: the connector's settings and the RDF store
+//! (`control-plane-graph`) that holds its catalog and its negotiation/
+//! transfer-process records, keyed by `providerPid` since this bootstrap
+//! only ever plays the Provider role.
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::Arc;
 
 use control_plane_core::catalog::{Catalog, DataService, Dataset, Distribution};
 use control_plane_core::common::{Offer, Rule};
-use control_plane_core::negotiation::ContractNegotiation;
-use control_plane_core::transfer::TransferProcess;
+use control_plane_graph::{ConnectorSettings, ControlPlaneGraph, GraphError};
 
 use crate::config::Config;
 
-/// A single, fixed dataset id this bootstrap always serves — see
-/// `../../../ARCHITECTURE.md` for why per-test dataset seeding
-/// (`CAT_NN_NN_DATASETID` etc.) is out of scope for this pass.
+/// The dataset id the catalog is seeded with when the settings graph holds
+/// no datasets yet — see `../../../ARCHITECTURE.md` for why per-test
+/// dataset seeding (`CAT_NN_NN_DATASETID` etc.) is out of scope for this
+/// pass.
 pub const SEED_DATASET_ID: &str = "urn:uuid:control-plane-rs-seed-dataset";
 const SEED_OFFER_ID: &str = "urn:uuid:control-plane-rs-seed-offer";
 const SEED_SERVICE_ID: &str = "urn:uuid:control-plane-rs-dataspace";
+const SEED_CATALOG_ID: &str = "urn:uuid:control-plane-rs-catalog";
 const SEED_FORMAT: &str = "HttpData-PULL";
 
 pub struct AppState {
     pub config: Config,
-    pub negotiations: Mutex<HashMap<String, ContractNegotiation>>,
-    pub transfers: Mutex<HashMap<String, TransferProcess>>,
+    /// The settings this process resolved at startup and wrote to the
+    /// settings graph.
+    pub settings: ConnectorSettings,
+    pub graph: Arc<ControlPlaneGraph>,
 }
 
 impl AppState {
-    pub fn new(config: Config) -> Self {
-        Self {
-            config,
-            negotiations: Mutex::new(HashMap::new()),
-            transfers: Mutex::new(HashMap::new()),
+    /// Opens the store `config` names (in memory when it names none),
+    /// writes this process's connector settings into the settings graph,
+    /// and seeds the catalog with [`seed_dataset`] the first time.
+    ///
+    /// The connector's identity (`agent_id`, `base_url`, `dsp_path`) always
+    /// comes from `config` — it describes this deployment — and is
+    /// rewritten on every start; the catalog lives only in the settings
+    /// graph and is never overwritten once present.
+    pub fn open(config: Config) -> Result<Self, GraphError> {
+        let graph = match &config.store_path {
+            Some(path) => ControlPlaneGraph::open(path)?,
+            None => ControlPlaneGraph::open_in_memory()?,
+        };
+        let settings = ConnectorSettings {
+            agent_id: config.agent_id.clone(),
+            base_url: config.base_url.clone(),
+            dsp_path: config.dsp_path.clone(),
+            catalog_id: SEED_CATALOG_ID.to_string(),
+            data_service_id: SEED_SERVICE_ID.to_string(),
+        };
+        graph.put_settings(&settings)?;
+        if graph.datasets()?.is_empty() {
+            graph.put_dataset(&seed_dataset(settings.data_service()))?;
         }
+        Ok(Self {
+            config,
+            settings,
+            graph: Arc::new(graph),
+        })
     }
 
     /// The `DataService` this connector advertises: its own DSP endpoint
-    /// root, where a Contract Negotiation / Transfer Process for the seed
-    /// dataset is initiated.
+    /// root, where a Contract Negotiation / Transfer Process is initiated.
     pub fn data_service(&self) -> DataService {
-        DataService {
-            id: SEED_SERVICE_ID.to_string(),
-            type_: "DataService".to_string(),
-            endpoint_url: self.config.dsp_base_url(),
-        }
+        self.settings.data_service()
     }
 
-    /// The single dataset this bootstrap always serves: an always-allow
-    /// `use` policy with no constraints, one `HttpData-PULL` distribution.
-    pub fn seed_dataset(&self) -> Dataset {
-        Dataset {
-            id: SEED_DATASET_ID.to_string(),
-            type_: "Dataset".to_string(),
-            has_policy: vec![Offer {
-                id: SEED_OFFER_ID.to_string(),
-                type_: "Offer".to_string(),
-                target: None,
-                permission: vec![Rule {
-                    action: "use".to_string(),
-                    constraint: vec![],
-                }],
-                prohibition: vec![],
-                obligation: vec![],
-            }],
-            distribution: vec![Distribution {
-                type_: "Distribution".to_string(),
-                format: SEED_FORMAT.to_string(),
-                access_service: self.data_service(),
-            }],
-        }
-    }
-
-    pub fn seed_catalog(&self) -> Catalog {
-        Catalog {
+    /// The catalog, built from the datasets in the settings graph.
+    pub fn catalog(&self) -> Result<Catalog, GraphError> {
+        Ok(Catalog {
             context: control_plane_core::dsp_context(),
-            id: "urn:uuid:control-plane-rs-catalog".to_string(),
+            id: self.settings.catalog_id.clone(),
             type_: "Catalog".to_string(),
-            participant_id: self.config.agent_id.clone(),
+            participant_id: self.settings.agent_id.clone(),
             service: vec![self.data_service()],
-            dataset: vec![self.seed_dataset()],
-        }
+            dataset: self.graph.datasets()?,
+        })
+    }
+}
+
+/// The dataset a fresh settings graph is seeded with: an always-allow `use`
+/// policy with no constraints, one `HttpData-PULL` distribution.
+pub fn seed_dataset(service: DataService) -> Dataset {
+    Dataset {
+        id: SEED_DATASET_ID.to_string(),
+        type_: "Dataset".to_string(),
+        has_policy: vec![Offer {
+            id: SEED_OFFER_ID.to_string(),
+            type_: "Offer".to_string(),
+            target: None,
+            permission: vec![Rule {
+                action: "use".to_string(),
+                constraint: vec![],
+            }],
+            prohibition: vec![],
+            obligation: vec![],
+        }],
+        distribution: vec![Distribution {
+            type_: "Distribution".to_string(),
+            format: SEED_FORMAT.to_string(),
+            access_service: service,
+        }],
     }
 }

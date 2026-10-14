@@ -67,7 +67,8 @@ side of a connector.
   is a documented risk of this bootstrap, not a silent guess.
 - **Catalog protocol HTTP surface** (`crates/control-plane-http/src/catalog.rs`):
   `POST {dsp}/catalog/request` and `GET {dsp}/catalog/datasets/:id`,
-  serving one fixed, in-memory seed dataset with a real DCAT/ODRL-shaped
+  serving the datasets in the settings graph (see "Contreforts: settings
+  and runtime persistence"), each a real DCAT/ODRL-shaped
   `Dataset`/`Offer`/`Distribution`/`DataService`.
 - **Contract negotiation HTTP surface, Provider role**
   (`crates/control-plane-http/src/negotiation.rs`): all six Provider path
@@ -95,11 +96,10 @@ side of a connector.
   the same Provider HTTP endpoints a real counter-party (or, in the TCK's
   case, the TCK itself acting as Consumer against `CN` tests that expect
   the Provider to be the one moving the state forward) would.
-- **Storage**: entirely in-memory (`std::sync::Mutex<HashMap<...>>`),
-  reset on every process restart.
-- **Catalog seeding**: exactly one fixed dataset id
-  (`urn:uuid:control-plane-rs-seed-dataset`), always present regardless of
-  what a caller asks for. `crates/control-plane-http/tests/dsp.tck.properties`
+- **Catalog seeding**: a fresh settings graph is seeded with exactly one
+  dataset id (`urn:uuid:control-plane-rs-seed-dataset`); more can be added
+  only through the Contreforts connector (there is no management HTTP API
+  yet). `crates/control-plane-http/tests/dsp.tck.properties`
   uses the TCK's own documented `CAT_<NN>_DATASETID` per-test override to
   point `CAT:01-01`/`CAT:01-02` at this fixed id, which is what lets the
   whole `CAT` group pass — see "TCK conformance snapshot". The TCK's
@@ -125,6 +125,95 @@ side of a connector.
 - **Pagination, filtering, compression** on the catalog endpoint.
 - **Authorization**: the `Authorization` header is accepted but never
   checked.
+
+## Contreforts: settings and runtime persistence
+
+**2026-10-14:** the catalog and all negotiation/transfer-process state moved
+off `Mutex<HashMap<...>>` and into an RDF store built on
+[Contreforts](https://github.com/contreforts-ai), following the pattern
+`ds-sql-dps-rs` and `ds-identity-hub-rs` already use, at the same pinned
+upstream commit, so all three connectors are directly comparable.
+
+**Vendoring:** `vendor/contreforts-core` is a git submodule pinned to
+`95a49404a60024a5b432b17f7a7c299a3dac9c3f` (upstream publishes no tags),
+and a workspace member that inherits `version`/`edition` from the root
+`Cargo.toml`, as its manifest expects. Clone with
+`git clone --recurse-submodules`, or run `git submodule update --init`
+in an existing checkout; a CI checkout needs `submodules: true`.
+
+**The store (`crates/control-plane-graph`):** one embedded Oxigraph store
+with two named graphs, split the way Contreforts' own `CONFIG_GRAPH`
+separates configuration from synced data:
+
+- **Settings graph** (`urn:ds-control-plane-rs:graph:settings`): the
+  connector's identity (`dspace:participantId`, base URL, DSP path, catalog
+  id, its own `dcat:DataService` and `dcat:endpointURL`) and every catalog
+  dataset as a `dcat:Dataset` with its ODRL offers (`odrl:hasPolicy`) and
+  `dcat:Distribution`s. Datasets and data services are named by their own
+  `@id` IRIs, so the graph is SPARQL-addressable by the same ids the
+  catalog serves. Distributions point at their data service by IRI, so a
+  new base URL rewrites one `dcat:endpointURL` triple, not every dataset.
+- **Runtime graph** (`urn:ds-control-plane-rs:graph:runtime`): one node per
+  contract negotiation and transfer process, named by its `providerPid`,
+  typed `dspace:ContractNegotiation`/`dspace:TransferProcess`, with its
+  state as the real DSP state IRI (`dspace:REQUESTED`, ...), the offer and
+  agreement as ODRL nodes, and a `dcterms:modified` timestamp.
+
+Vocabulary is real DSP (`https://w3id.org/dspace/2025/1/`), DCAT, Dublin
+Core and ODRL wherever a term exists, plus this project's own
+`https://ds42.org/ontologies/ds-control-plane-rs#` (`dscp:`) for connector
+settings, `dscp:order` (array order, which plain RDF loses; same reason as
+the siblings' `ds:order`) and `dscp:policyId`. A policy's `@id` is a
+literal on a blank node rather than the node's IRI because offer ids come
+from the counterparty, and two negotiations quoting one id must not share
+a node. `rightOperand` is stored as an `rdf:JSON` literal so any JSON value
+round-trips exactly.
+
+Request input never reaches a SPARQL string: a `providerPid` or dataset id
+from an HTTP path becomes a `NamedNode` (an invalid IRI is simply "not
+found") matched with `quads_for_pattern`, and everything else a
+counterparty sends is a plain literal. Each write replaces a record's node
+and the blank nodes under it in one transaction, under a write lock, so
+`update_negotiation`/`update_transfer` are atomic read-modify-writes.
+
+**Persistence:** set `GRAPH_STORE_PATH` (the variable Contreforts' own
+`GraphConfig` reads) to a directory and the store is RocksDB-backed:
+the catalog, negotiations and transfer processes survive a restart
+(`crates/control-plane-http/tests/persistence.rs` drives the real router,
+restarts on the same directory and reads everything back). Unset, the
+store is in memory as before. RocksDB is oxigraph's `rocksdb` feature,
+a from-source C++ build, on by default through `control-plane-graph`'s
+own `rocksdb` feature. Only one process can hold a store directory open.
+
+**What is settings and what is deployment:** the connector's identity
+(`AGENT_ID`, `BASE_URL`, `DSP_PATH`) describes the deployment, so it comes
+from the environment and is rewritten into the settings graph on every
+start. The catalog lives only in the settings graph: seeded once with the
+default dataset when empty, then never overwritten by a restart.
+
+**The connector (`crates/control-plane-contreforts`):** implements
+`ContrefortsConnector` over the store with three kinds of its own,
+declared in `src/declaration.ttl` with `contreforts:entityKind` so a
+driver can resolve each back to its class:
+
+| Kind | Graph | `pull`/`get` | `push`/`update` |
+|---|---|---|---|
+| `ds-control-plane-rs:dataset` | settings | yes | add/replace a catalog dataset |
+| `ds-control-plane-rs:contract-negotiation` | runtime | yes, `since` filters on `dcterms:modified` | unsupported |
+| `ds-control-plane-rs:transfer-process` | runtime | yes, `since` filters on `dcterms:modified` | unsupported |
+
+Datasets are writable because they are settings; negotiations and
+transfers only change through the DSP protocol itself. The declaration is
+checked against Contreforts' real SHACL meta-shapes and lints by
+`tests/declaration_validates.rs`. As with the sibling projects, nothing
+here has been run against a real Contreforts deployment
+(`contreforts-product` is private).
+
+**Not addressed here:** the runtime graph grows without bound, as the
+`HashMap`s did, but now on disk; a counterparty allowed to call
+`negotiations/request` can keep adding records. `ds-identity-hub-rs` caps
+its equivalent structures with oldest-first eviction; the same is worth
+doing here before this runs anywhere exposed.
 
 ## TCK conformance snapshot
 

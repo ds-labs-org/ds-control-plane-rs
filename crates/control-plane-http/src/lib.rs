@@ -35,7 +35,18 @@ pub struct App {
 /// `TcpListener::local_addr()` when `config.port == 0`.
 pub async fn build(config: Config) -> anyhow::Result<App> {
     let dsp = &config.dsp_path;
-    let state = Arc::new(AppState::new(config.clone()));
+    let state = Arc::new(AppState::open(config.clone())?);
+    let restored = (
+        state.graph.negotiations()?.len(),
+        state.graph.transfers()?.len(),
+    );
+    tracing::info!(
+        store = ?config.store_path,
+        datasets = state.graph.datasets()?.len(),
+        negotiations = restored.0,
+        transfers = restored.1,
+        "opened control plane graph"
+    );
 
     let router = Router::new()
         .route(

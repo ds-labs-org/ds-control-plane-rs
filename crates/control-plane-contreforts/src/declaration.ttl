@@ -1,0 +1,73 @@
+########################################################################
+# ds-control-plane-rs -- self-description for Contreforts' connector
+# interface
+#
+# Same pattern as ds-identity-hub-rs/crates/identity-hub-contreforts and
+# ds-sql-dps-rs/contreforts-connector: extension vocabulary and fields live
+# in this connector's own namespace, never under Contreforts' shared core:
+# namespace. None of the three entities below has a good alignment target
+# among core's 15 business-sync concepts (customer, invoice, project, ...),
+# so none is forced into one.
+#
+# Each class names the EntityKind string the connector answers to via
+# contreforts:entityKind, so a Contreforts driver can resolve a pulled
+# document's kind back to its class.
+########################################################################
+
+@prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+@prefix sh:   <http://www.w3.org/ns/shacl#> .
+
+@prefix dscp: <https://ds42.org/ontologies/ds-control-plane-rs#> .
+@prefix contreforts: <https://contreforts.ds-labs.org/ontologies/declaration#> .
+
+########################################################################
+# Entity vocabulary
+########################################################################
+
+dscp:CatalogDataset a rdfs:Class ;
+    rdfs:label "Catalog dataset" ;
+    rdfs:comment """One dataset this connector offers in its DSP catalog,
+with its ODRL offers and distributions. Lives in the settings graph of
+control-plane-graph (a dcat:Dataset there). The only kind this connector
+accepts writes for: push/update add or replace a dataset in the catalog.""" ;
+    contreforts:entityKind "ds-control-plane-rs:dataset" .
+
+dscp:ContractNegotiation a rdfs:Class ;
+    rdfs:label "Contract negotiation" ;
+    rdfs:comment """One DSP contract negotiation this connector takes part
+in as Provider: its state, the offer under negotiation and, once agreed,
+the agreement. Lives in the runtime graph of control-plane-graph (a
+dspace:ContractNegotiation there). Read-only through this interface.""" ;
+    contreforts:entityKind "ds-control-plane-rs:contract-negotiation" .
+
+dscp:TransferProcess a rdfs:Class ;
+    rdfs:label "Transfer process" ;
+    rdfs:comment """One DSP transfer process this connector takes part in
+as Provider. Lives in the runtime graph of control-plane-graph (a
+dspace:TransferProcess there). Read-only through this interface.""" ;
+    contreforts:entityKind "ds-control-plane-rs:transfer-process" .
+
+########################################################################
+# Configuration schema
+#
+# One running control plane owns exactly one store, so there is nothing to
+# route between; this field exists so the declaration carries a real,
+# meta-shape-valid connector shape, as the sibling declarations do.
+########################################################################
+
+dscp:ControlPlaneConnectorShape a sh:NodeShape ;
+    sh:targetClass dscp:ControlPlaneConnector ;
+    contreforts:category "dataspace" ;
+
+    sh:property [
+        sh:path dscp:graphSource ;
+        sh:name "Graph source" ;
+        sh:description "Identifies which control plane store this connector serves. A running control plane has exactly one, named 'primary'." ;
+        sh:datatype xsd:string ;
+        sh:nodeKind sh:Literal ;
+        sh:minCount 1 ;
+        sh:maxCount 1 ;
+        sh:order 1 ;
+    ] .

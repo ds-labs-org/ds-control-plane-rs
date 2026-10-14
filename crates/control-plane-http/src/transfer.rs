@@ -14,7 +14,23 @@ use control_plane_core::transfer::{
     TransferStartMessage, TransferState, TransferSuspensionMessage, TransferTerminationMessage,
 };
 
+use control_plane_graph::GraphError;
+
 use crate::state::AppState;
+
+fn store_error(provider_pid: Option<&str>, e: GraphError) -> axum::response::Response {
+    tracing::error!(error = %e, "transfer store error");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(TransferErrorMessage::new(
+            provider_pid.map(str::to_string),
+            None,
+            "500",
+            "transfer process store error",
+        )),
+    )
+        .into_response()
+}
 
 fn not_found(provider_pid: &str) -> impl IntoResponse {
     (
@@ -50,10 +66,10 @@ pub async fn get_transfer(
     State(state): State<Arc<AppState>>,
     Path(provider_pid): Path<String>,
 ) -> impl IntoResponse {
-    let transfers = state.transfers.lock().expect("transfers lock poisoned");
-    match transfers.get(&provider_pid) {
-        Some(t) => (StatusCode::OK, Json(t.to_ack())).into_response(),
-        None => not_found(&provider_pid).into_response(),
+    match state.graph.transfer(&provider_pid) {
+        Ok(Some(t)) => (StatusCode::OK, Json(t.to_ack())).into_response(),
+        Ok(None) => not_found(&provider_pid).into_response(),
+        Err(e) => store_error(Some(&provider_pid), e),
     }
 }
 
@@ -66,18 +82,15 @@ pub async fn initiate_transfer(
 ) -> impl IntoResponse {
     let provider_pid = format!("urn:uuid:{}", uuid::Uuid::new_v4());
     let transfer = TransferProcess::new(
-        provider_pid.clone(),
+        provider_pid,
         msg.consumer_pid.clone(),
         msg.agreement_id,
         msg.format,
     );
-    let ack = transfer.to_ack();
-    state
-        .transfers
-        .lock()
-        .expect("transfers lock poisoned")
-        .insert(provider_pid, transfer);
-    (StatusCode::CREATED, Json(ack))
+    match state.graph.put_transfer(&transfer) {
+        Ok(()) => (StatusCode::CREATED, Json(transfer.to_ack())).into_response(),
+        Err(e) => store_error(None, e),
+    }
 }
 
 /// `POST {dsp}/transfers/:providerPid/start`.
@@ -121,13 +134,16 @@ async fn transition(
     provider_pid: &str,
     to: TransferState,
 ) -> axum::response::Response {
-    let mut transfers = state.transfers.lock().expect("transfers lock poisoned");
-    let Some(t) = transfers.get_mut(provider_pid) else {
-        return not_found(provider_pid).into_response();
-    };
-    let from = t.state;
-    match t.transition(to) {
-        Ok(()) => StatusCode::OK.into_response(),
-        Err(_) => bad_transition(provider_pid, &t.consumer_pid, from, to).into_response(),
+    let result = state.graph.update_transfer(provider_pid, |t| {
+        let from = t.state;
+        t.transition(to).map_err(|_| (from, t.consumer_pid.clone()))
+    });
+    match result {
+        Ok(Some(Ok(()))) => StatusCode::OK.into_response(),
+        Ok(Some(Err((from, consumer_pid)))) => {
+            bad_transition(provider_pid, &consumer_pid, from, to).into_response()
+        }
+        Ok(None) => not_found(provider_pid).into_response(),
+        Err(e) => store_error(Some(provider_pid), e),
     }
 }

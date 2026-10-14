@@ -10,11 +10,20 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use control_plane_core::catalog::{CatalogError, CatalogRequestMessage, DatasetDocument};
 
-use crate::state::{AppState, SEED_DATASET_ID};
+use crate::state::AppState;
 
-/// `POST {dsp}/catalog/request`. This bootstrap always returns the single
-/// seed dataset — `filter` is accepted (parsed if present) but never
-/// applied; see `../../../ARCHITECTURE.md`.
+fn store_error(e: control_plane_graph::GraphError) -> axum::response::Response {
+    tracing::error!(error = %e, "catalog store error");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(CatalogError::new("500", "catalog store error")),
+    )
+        .into_response()
+}
+
+/// `POST {dsp}/catalog/request`. Returns every dataset in the settings
+/// graph — `filter` is accepted (parsed if present) but never applied; see
+/// `../../../ARCHITECTURE.md`.
 pub async fn catalog_request(
     State(state): State<Arc<AppState>>,
     body: Option<Json<CatalogRequestMessage>>,
@@ -22,7 +31,10 @@ pub async fn catalog_request(
     if let Some(Json(msg)) = &body {
         tracing::debug!(filter = ?msg.filter, "catalog request received");
     }
-    (StatusCode::OK, Json(state.seed_catalog()))
+    match state.catalog() {
+        Ok(catalog) => (StatusCode::OK, Json(catalog)).into_response(),
+        Err(e) => store_error(e),
+    }
 }
 
 /// `GET {dsp}/catalog/datasets/:id`.
@@ -30,20 +42,16 @@ pub async fn dataset_request(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if id == SEED_DATASET_ID {
-        (
-            StatusCode::OK,
-            Json(DatasetDocument::from(state.seed_dataset())),
-        )
-            .into_response()
-    } else {
-        (
+    match state.graph.dataset(&id) {
+        Ok(Some(dataset)) => (StatusCode::OK, Json(DatasetDocument::from(dataset))).into_response(),
+        Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(CatalogError::new(
                 "404",
                 format!("no dataset with id '{id}'"),
             )),
         )
-            .into_response()
+            .into_response(),
+        Err(e) => store_error(e),
     }
 }

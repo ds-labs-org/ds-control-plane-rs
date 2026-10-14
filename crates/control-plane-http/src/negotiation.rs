@@ -16,6 +16,8 @@ use control_plane_core::negotiation::{
     NegotiationEventType, NegotiationState,
 };
 
+use control_plane_graph::GraphError;
+
 use crate::state::AppState;
 
 fn not_found(provider_pid: &str) -> impl IntoResponse {
@@ -28,6 +30,41 @@ fn not_found(provider_pid: &str) -> impl IntoResponse {
             format!("no contract negotiation with providerPid '{provider_pid}'"),
         )),
     )
+}
+
+fn store_error(provider_pid: Option<&str>, e: GraphError) -> axum::response::Response {
+    tracing::error!(error = %e, "negotiation store error");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ContractNegotiationError::new(
+            provider_pid.map(str::to_string),
+            None,
+            "500",
+            "negotiation store error",
+        )),
+    )
+        .into_response()
+}
+
+/// Applies `to` to the stored negotiation `provider_pid` and maps the
+/// outcome to the HTTP response every state-changing endpoint shares.
+fn transition(
+    state: &AppState,
+    provider_pid: &str,
+    to: NegotiationState,
+) -> axum::response::Response {
+    let result = state.graph.update_negotiation(provider_pid, |n| {
+        let from = n.state;
+        n.transition(to).map_err(|_| (from, n.consumer_pid.clone()))
+    });
+    match result {
+        Ok(Some(Ok(()))) => StatusCode::OK.into_response(),
+        Ok(Some(Err((from, consumer_pid)))) => {
+            bad_transition(provider_pid, &consumer_pid, from, to).into_response()
+        }
+        Ok(None) => not_found(provider_pid).into_response(),
+        Err(e) => store_error(Some(provider_pid), e),
+    }
 }
 
 fn bad_transition(
@@ -52,13 +89,10 @@ pub async fn get_negotiation(
     State(state): State<Arc<AppState>>,
     Path(provider_pid): Path<String>,
 ) -> impl IntoResponse {
-    let negotiations = state
-        .negotiations
-        .lock()
-        .expect("negotiations lock poisoned");
-    match negotiations.get(&provider_pid) {
-        Some(n) => (StatusCode::OK, Json(n.to_ack())).into_response(),
-        None => not_found(&provider_pid).into_response(),
+    match state.graph.negotiation(&provider_pid) {
+        Ok(Some(n)) => (StatusCode::OK, Json(n.to_ack())).into_response(),
+        Ok(None) => not_found(&provider_pid).into_response(),
+        Err(e) => store_error(Some(&provider_pid), e),
     }
 }
 
@@ -70,16 +104,13 @@ pub async fn initiate_negotiation(
     Json(msg): Json<ContractRequestMessage>,
 ) -> impl IntoResponse {
     let provider_pid = format!("urn:uuid:{}", uuid::Uuid::new_v4());
-    let mut negotiation = ContractNegotiation::new(provider_pid.clone(), msg.consumer_pid.clone());
+    let mut negotiation = ContractNegotiation::new(provider_pid, msg.consumer_pid.clone());
     negotiation.dataset_id = msg.offer.target.clone();
     negotiation.offer = Some(msg.offer);
-    let ack = negotiation.to_ack();
-    state
-        .negotiations
-        .lock()
-        .expect("negotiations lock poisoned")
-        .insert(provider_pid, negotiation);
-    (StatusCode::CREATED, Json(ack))
+    match state.graph.put_negotiation(&negotiation) {
+        Ok(()) => (StatusCode::CREATED, Json(negotiation.to_ack())).into_response(),
+        Err(e) => store_error(None, e),
+    }
 }
 
 /// `POST {dsp}/negotiations/:providerPid/request` — a Consumer counter-offer
@@ -92,16 +123,14 @@ pub async fn continue_negotiation(
     Path(provider_pid): Path<String>,
     Json(msg): Json<ContractRequestMessage>,
 ) -> impl IntoResponse {
-    let mut negotiations = state
-        .negotiations
-        .lock()
-        .expect("negotiations lock poisoned");
-    match negotiations.get_mut(&provider_pid) {
-        Some(n) => {
-            n.offer = Some(msg.offer);
-            StatusCode::OK.into_response()
-        }
-        None => not_found(&provider_pid).into_response(),
+    let result = state.graph.update_negotiation(&provider_pid, |n| {
+        n.offer = Some(msg.offer);
+        Ok::<(), ()>(())
+    });
+    match result {
+        Ok(Some(_)) => StatusCode::OK.into_response(),
+        Ok(None) => not_found(&provider_pid).into_response(),
+        Err(e) => store_error(Some(&provider_pid), e),
     }
 }
 
@@ -113,36 +142,24 @@ pub async fn negotiation_event(
     Path(provider_pid): Path<String>,
     Json(msg): Json<ContractNegotiationEventMessage>,
 ) -> impl IntoResponse {
-    let mut negotiations = state
-        .negotiations
-        .lock()
-        .expect("negotiations lock poisoned");
-    let Some(n) = negotiations.get_mut(&provider_pid) else {
-        return not_found(&provider_pid).into_response();
-    };
     if msg.event_type != NegotiationEventType::Accepted {
+        let consumer_pid = match state.graph.negotiation(&provider_pid) {
+            Ok(Some(n)) => n.consumer_pid,
+            Ok(None) => return not_found(&provider_pid).into_response(),
+            Err(e) => return store_error(Some(&provider_pid), e),
+        };
         return (
             StatusCode::BAD_REQUEST,
             Json(ContractNegotiationError::new(
                 Some(provider_pid.clone()),
-                Some(n.consumer_pid.clone()),
+                Some(consumer_pid),
                 "400",
                 "a Consumer MUST NOT send a ContractNegotiationEventMessage with eventType FINALIZED",
             )),
         )
             .into_response();
     }
-    let from = n.state;
-    match n.transition(NegotiationState::Accepted) {
-        Ok(()) => StatusCode::OK.into_response(),
-        Err(_) => bad_transition(
-            &provider_pid,
-            &n.consumer_pid,
-            from,
-            NegotiationState::Accepted,
-        )
-        .into_response(),
-    }
+    transition(&state, &provider_pid, NegotiationState::Accepted)
 }
 
 /// `POST {dsp}/negotiations/:providerPid/agreement/verification`.
@@ -151,24 +168,7 @@ pub async fn verify_agreement(
     Path(provider_pid): Path<String>,
     Json(_msg): Json<ContractAgreementVerificationMessage>,
 ) -> impl IntoResponse {
-    let mut negotiations = state
-        .negotiations
-        .lock()
-        .expect("negotiations lock poisoned");
-    let Some(n) = negotiations.get_mut(&provider_pid) else {
-        return not_found(&provider_pid).into_response();
-    };
-    let from = n.state;
-    match n.transition(NegotiationState::Verified) {
-        Ok(()) => StatusCode::OK.into_response(),
-        Err(_) => bad_transition(
-            &provider_pid,
-            &n.consumer_pid,
-            from,
-            NegotiationState::Verified,
-        )
-        .into_response(),
-    }
+    transition(&state, &provider_pid, NegotiationState::Verified)
 }
 
 /// `POST {dsp}/negotiations/:providerPid/termination`.
@@ -177,22 +177,5 @@ pub async fn terminate_negotiation(
     Path(provider_pid): Path<String>,
     Json(_msg): Json<ContractNegotiationTerminationMessage>,
 ) -> impl IntoResponse {
-    let mut negotiations = state
-        .negotiations
-        .lock()
-        .expect("negotiations lock poisoned");
-    let Some(n) = negotiations.get_mut(&provider_pid) else {
-        return not_found(&provider_pid).into_response();
-    };
-    let from = n.state;
-    match n.transition(NegotiationState::Terminated) {
-        Ok(()) => StatusCode::OK.into_response(),
-        Err(_) => bad_transition(
-            &provider_pid,
-            &n.consumer_pid,
-            from,
-            NegotiationState::Terminated,
-        )
-        .into_response(),
-    }
+    transition(&state, &provider_pid, NegotiationState::Terminated)
 }
