@@ -309,6 +309,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn push_rejects_a_dataset_colliding_with_the_data_service() {
+        let graph = graph();
+        let connector = ControlPlaneConnector::new(graph.clone());
+        connector.push(&dataset_doc("urn:uuid:ds")).await.unwrap();
+        let snapshot = || {
+            (
+                graph.settings().unwrap(),
+                serde_json::to_value(graph.datasets().unwrap()).unwrap(),
+            )
+        };
+        let before = snapshot();
+
+        let result = connector.push(&dataset_doc("urn:uuid:service")).await;
+        assert!(
+            matches!(result, Err(ConnectorError::Config(_))),
+            "{result:?}"
+        );
+        assert_eq!(snapshot(), before);
+    }
+
+    #[tokio::test]
     async fn update_rejects_a_mismatched_id() {
         let connector = ControlPlaneConnector::new(graph());
         let mut doc = dataset_doc("urn:uuid:ds");

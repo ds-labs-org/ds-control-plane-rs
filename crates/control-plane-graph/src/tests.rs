@@ -343,3 +343,87 @@ fn data_service_is_readable_by_id() {
     assert_eq!(service.endpoint_url, "http://localhost:8080/dsp/2025-1");
     assert!(graph.data_service("urn:uuid:nope").unwrap().is_none());
 }
+
+/// A store with settings and two datasets, `urn:ds:a` and `urn:ds:b`.
+fn seeded() -> (ControlPlaneGraph, ConnectorSettings) {
+    let s = settings();
+    let graph = ControlPlaneGraph::open_in_memory().unwrap();
+    graph.put_settings(&s).unwrap();
+    graph.put_dataset(&dataset("urn:ds:a", &s)).unwrap();
+    graph.put_dataset(&dataset("urn:ds:b", &s)).unwrap();
+    (graph, s)
+}
+
+/// `put` must be rejected and leave settings and every dataset exactly as
+/// they were, including after the startup `put_settings` runs again.
+fn assert_rejected_without_damage(
+    graph: &ControlPlaneGraph,
+    s: &ConnectorSettings,
+    put: Result<(), GraphError>,
+) {
+    let before = (Some(s.clone()), {
+        let fresh = ControlPlaneGraph::open_in_memory().unwrap();
+        fresh.put_settings(s).unwrap();
+        fresh.put_dataset(&dataset("urn:ds:a", s)).unwrap();
+        fresh.put_dataset(&dataset("urn:ds:b", s)).unwrap();
+        serde_json::to_value(fresh.datasets().unwrap()).unwrap()
+    });
+    let now = |g: &ControlPlaneGraph| {
+        (
+            g.settings().unwrap(),
+            serde_json::to_value(g.datasets().unwrap()).unwrap(),
+        )
+    };
+    assert!(put.is_err(), "colliding write was accepted");
+    assert_eq!(now(graph), before);
+    graph.put_settings(s).unwrap();
+    assert_eq!(now(graph), before);
+}
+
+#[test]
+fn access_service_id_equal_to_another_dataset_is_rejected() {
+    let (graph, s) = seeded();
+    let mut c = dataset("urn:ds:c", &s);
+    c.distribution[1].access_service.id = "urn:ds:a".to_string();
+    let put = graph.put_dataset(&c);
+    assert_rejected_without_damage(&graph, &s, put);
+}
+
+#[test]
+fn dataset_or_access_service_id_equal_to_the_settings_node_is_rejected() {
+    let (graph, s) = seeded();
+    let put = graph.put_dataset(&dataset(crate::vocab::SETTINGS_NODE, &s));
+    assert_rejected_without_damage(&graph, &s, put);
+
+    let mut c = dataset("urn:ds:c", &s);
+    c.distribution[0].access_service.id = crate::vocab::SETTINGS_NODE.to_string();
+    let put = graph.put_dataset(&c);
+    assert_rejected_without_damage(&graph, &s, put);
+}
+
+#[test]
+fn dataset_id_equal_to_a_data_service_is_rejected() {
+    let (graph, s) = seeded();
+    let put = graph.put_dataset(&dataset(&s.data_service_id, &s));
+    assert_rejected_without_damage(&graph, &s, put);
+}
+
+#[test]
+fn access_service_id_equal_to_its_own_dataset_is_rejected() {
+    let (graph, s) = seeded();
+    let mut c = dataset("urn:ds:c", &s);
+    c.distribution[0].access_service.id = "urn:ds:c".to_string();
+    let put = graph.put_dataset(&c);
+    assert_rejected_without_damage(&graph, &s, put);
+}
+
+#[test]
+fn settings_whose_service_id_is_a_dataset_are_rejected() {
+    let (graph, s) = seeded();
+    let moved = ConnectorSettings {
+        data_service_id: "urn:ds:a".to_string(),
+        ..s.clone()
+    };
+    let put = graph.put_settings(&moved);
+    assert_rejected_without_damage(&graph, &s, put);
+}
