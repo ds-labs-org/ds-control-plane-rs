@@ -7,6 +7,8 @@
 //! service node itself (its `dcat:endpointURL`) is shared, so moving the
 //! connector to a new base URL rewrites one triple, not every dataset.
 
+use std::collections::HashMap;
+
 use control_plane_core::catalog::{DataService, Dataset, Distribution};
 use oxigraph::model::{Literal, NamedNode, NamedOrBlankNode, NamedOrBlankNodeRef, Term};
 
@@ -219,7 +221,11 @@ impl ControlPlaneGraph {
     /// one transaction. Fails with [`GraphError::Conflict`], writing
     /// nothing, when the dataset id or a data service id names the settings
     /// node or a record of another kind, or a data service id equals the
-    /// dataset's own.
+    /// dataset's own, or a data service already stored (or named earlier in
+    /// the same dataset) with a different endpoint: data service nodes are
+    /// shared, so a push only adds new ones and never moves an existing
+    /// endpoint. The connector's own service is written by
+    /// [`Self::put_settings`] alone.
     pub fn put_dataset(&self, dataset: &Dataset) -> Result<(), GraphError> {
         let _guard = self.write_guard();
         let graph = settings_graph();
@@ -232,6 +238,7 @@ impl ControlPlaneGraph {
             write_offer(&mut w, node.clone(), odrl("hasPolicy"), i, offer);
         }
         let mut records = Vec::new();
+        let mut pushed: HashMap<NamedNode, String> = HashMap::new();
         for (i, d) in dataset.distribution.iter().enumerate() {
             let child = w.add_child(node.clone(), dcat("distribution"), i);
             w.add_type(child.clone(), dcat("Distribution"));
@@ -247,6 +254,32 @@ impl ControlPlaneGraph {
             }
             check_kind(&r, &service, &dcat("DataService"))?;
             w.add(child, dcat("accessService"), service.clone());
+            let endpoint_conflict = |existing: &str| GraphError::Conflict {
+                node: service.as_str().to_string(),
+                kind: dcat("DataService"),
+                reason: format!(
+                    "it already has endpoint {existing}, not {}",
+                    d.access_service.endpoint_url
+                ),
+            };
+            // A service node is shared by every distribution naming it, so
+            // a dataset push only ever adds new ones: rewriting an existing
+            // one (the connector's own is written by `put_settings`) would
+            // move the endpoint of every other dataset too.
+            if r.has_type(service.as_ref().into(), &dcat("DataService"))? {
+                let existing = read_data_service(&r, &service)?;
+                if existing.endpoint_url != d.access_service.endpoint_url {
+                    return Err(endpoint_conflict(&existing.endpoint_url));
+                }
+                continue;
+            }
+            if let Some(existing) = pushed.get(&service) {
+                if *existing != d.access_service.endpoint_url {
+                    return Err(endpoint_conflict(existing));
+                }
+                continue;
+            }
+            pushed.insert(service.clone(), d.access_service.endpoint_url.clone());
             records.push((service, sw.quads));
         }
         records.insert(0, (node, w.quads));

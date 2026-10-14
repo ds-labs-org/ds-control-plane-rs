@@ -186,8 +186,13 @@ Datasets, data services and the settings node share the settings graph, so
 replace is the settings node or already typed as another kind of record
 (a dataset id naming a data service, an `accessService` naming a dataset or
 its own dataset): such a write fails with `GraphError::Conflict` (a
-`Config` error through Contreforts) and nothing is written. A dataset and
-its data services are replaced in one transaction.
+`Config` error through Contreforts) and nothing is written. A data service
+node is shared by every distribution that names it, so `put_dataset` only
+adds data services that do not exist yet and never rewrites one: a pushed
+`accessService` whose `endpointURL` differs from the stored node (including
+the connector's own, which only `put_settings` writes) or from another
+distribution in the same push is a `GraphError::Conflict` too. A dataset
+and its new data services are written in one transaction.
 
 **Persistence:** set `GRAPH_STORE_PATH` (the variable Contreforts' own
 `GraphConfig` reads) to a directory and the store is RocksDB-backed:
