@@ -427,3 +427,53 @@ fn settings_whose_service_id_is_a_dataset_are_rejected() {
     let put = graph.put_settings(&moved);
     assert_rejected_without_damage(&graph, &s, put);
 }
+
+/// Readers must never see a record half-rewritten: `replace` swaps every
+/// blank node of an offer for a fresh one, so a read that lists the old
+/// children and then looks up their properties after the swap would fail
+/// with `GraphError::Missing`.
+#[test]
+fn reads_concurrent_with_rewrites_see_whole_records() {
+    let graph = ControlPlaneGraph::open_in_memory().unwrap();
+    let s = settings();
+    graph.put_settings(&s).unwrap();
+    graph.put_negotiation(&negotiation()).unwrap();
+    graph.put_dataset(&dataset("urn:uuid:d1", &s)).unwrap();
+    let done = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            for _ in 0..1000 {
+                graph
+                    .update_negotiation("urn:uuid:n1", |_| Ok::<(), ()>(()))
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                graph.put_dataset(&dataset("urn:uuid:d1", &s)).unwrap();
+            }
+            done.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let mut failures = Vec::new();
+        while !done.load(std::sync::atomic::Ordering::Acquire) {
+            match graph.negotiation("urn:uuid:n1") {
+                Ok(Some(_)) => {}
+                other => failures.push(format!("negotiation: {other:?}")),
+            }
+            if let Err(e) = graph.negotiations() {
+                failures.push(format!("negotiations: {e}"));
+            }
+            match graph.dataset("urn:uuid:d1") {
+                Ok(Some(_)) => {}
+                other => failures.push(format!("dataset: {other:?}")),
+            }
+            if let Err(e) = graph.datasets() {
+                failures.push(format!("datasets: {e}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} torn reads, first: {}",
+            failures.len(),
+            failures[0]
+        );
+    });
+}
