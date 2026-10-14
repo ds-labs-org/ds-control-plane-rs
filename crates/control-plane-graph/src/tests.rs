@@ -428,6 +428,67 @@ fn settings_whose_service_id_is_a_dataset_are_rejected() {
     assert_rejected_without_damage(&graph, &s, put);
 }
 
+/// A data service node is shared by every distribution that names it, so a
+/// dataset push must not rewrite its endpoint: not the connector's own
+/// (only `put_settings` writes that), not another dataset's, and not with
+/// two different endpoints in one push.
+#[test]
+fn pushing_a_different_endpoint_for_a_known_service_is_rejected() {
+    let (graph, s) = seeded();
+    let mut c = dataset("urn:ds:c", &s);
+    c.distribution[0].access_service.endpoint_url = "http://evil.example/dsp".to_string();
+    let put = graph.put_dataset(&c);
+    assert_rejected_without_damage(&graph, &s, put);
+    assert_eq!(
+        graph
+            .data_service(&s.data_service_id)
+            .unwrap()
+            .unwrap()
+            .endpoint_url,
+        s.dsp_base_url()
+    );
+
+    let shared = DataService {
+        id: "urn:svc:shared".to_string(),
+        type_: "DataService".to_string(),
+        endpoint_url: "http://shared.example/dsp".to_string(),
+    };
+    let mut c = dataset("urn:ds:c", &s);
+    c.distribution[0].access_service = shared.clone();
+    graph.put_dataset(&c).unwrap();
+    let mut d = dataset("urn:ds:d", &s);
+    d.distribution[0].access_service = DataService {
+        endpoint_url: "http://elsewhere.example/dsp".to_string(),
+        ..shared.clone()
+    };
+    assert!(matches!(
+        graph.put_dataset(&d),
+        Err(GraphError::Conflict { .. })
+    ));
+    assert_eq!(
+        graph
+            .data_service(&shared.id)
+            .unwrap()
+            .unwrap()
+            .endpoint_url,
+        shared.endpoint_url
+    );
+    assert!(graph.dataset("urn:ds:d").unwrap().is_none());
+
+    let mut e = dataset("urn:ds:e", &s);
+    e.distribution[0].access_service.id = "urn:svc:fresh".to_string();
+    e.distribution[1].access_service = DataService {
+        id: "urn:svc:fresh".to_string(),
+        type_: "DataService".to_string(),
+        endpoint_url: "http://other.example/dsp".to_string(),
+    };
+    assert!(matches!(
+        graph.put_dataset(&e),
+        Err(GraphError::Conflict { .. })
+    ));
+    assert!(graph.data_service("urn:svc:fresh").unwrap().is_none());
+}
+
 /// Readers must never see a record half-rewritten: `replace` swaps every
 /// blank node of an offer for a fresh one, so a read that lists the old
 /// children and then looks up their properties after the swap would fail
