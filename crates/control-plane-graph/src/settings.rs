@@ -13,7 +13,7 @@ use control_plane_core::catalog::{DataService, Dataset, Distribution};
 use oxigraph::model::{Literal, NamedNode, NamedOrBlankNode, NamedOrBlankNodeRef, Term};
 
 use crate::policy::{read_offer, write_offer};
-use crate::store::{ControlPlaneGraph, GraphError, Reader, Writer, iri, lookup_iri};
+use crate::store::{ControlPlaneGraph, GraphError, Reader, Writer, iri, lookup_iri, readable};
 use crate::vocab::{SETTINGS_GRAPH, SETTINGS_NODE, dcat, dcterms, dscp, dspace, odrl, xsd};
 
 /// The connector's own identity, as stored in the settings graph.
@@ -184,7 +184,14 @@ impl ControlPlaneGraph {
         read_data_service(&r, &node).map(Some)
     }
 
-    /// Every catalog dataset in the settings graph, sorted by id.
+    /// The number of catalog datasets, without reading them.
+    pub fn dataset_count(&self) -> Result<usize, GraphError> {
+        self.count(&settings_graph(), &dcat("Dataset"))
+    }
+
+    /// Every readable catalog dataset in the settings graph, sorted by id.
+    /// A dataset that fails to decode is skipped with a warning; look it up
+    /// with [`Self::dataset`] to see why.
     pub fn datasets(&self) -> Result<Vec<Dataset>, GraphError> {
         let _guard = self.read_guard();
         let graph = settings_graph();
@@ -198,7 +205,7 @@ impl ControlPlaneGraph {
             })
             .collect();
         nodes.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        nodes.iter().map(|n| read_dataset(&r, n)).collect()
+        readable("dataset", &nodes, |n| read_dataset(&r, n))
     }
 
     /// One catalog dataset by `@id`, or `None` if there is no such dataset

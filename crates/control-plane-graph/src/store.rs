@@ -104,6 +104,14 @@ impl ControlPlaneGraph {
         self.lock.read().expect("graph lock poisoned")
     }
 
+    /// The number of `class` instances in `graph`, without decoding any of
+    /// them: cheap enough for startup logging and the seeding check, and
+    /// never failed by one damaged record.
+    pub(crate) fn count(&self, graph: &NamedNode, class: &str) -> Result<usize, GraphError> {
+        let _guard = self.read_guard();
+        Ok(self.reader(graph).instances(class)?.len())
+    }
+
     /// Replaces the record rooted at `root` in `graph` with `quads`
     /// atomically: removes `root`'s own triples and every blank node
     /// reachable from it, then inserts `quads`.
@@ -403,6 +411,29 @@ impl Reader<'_> {
 
 /// A `NamedNode` for one of this crate's own vocabulary IRIs, which are
 /// all built from the constants in [`crate::vocab`] and known valid.
+/// Decodes every node of a list read with `read`, skipping (and logging)
+/// the ones that fail to decode instead of failing the whole list: one
+/// damaged record must not hide every other one, nor stop the server from
+/// starting. Storage errors still fail the list. Single-record lookups
+/// keep reporting the damage.
+pub(crate) fn readable<T>(
+    kind: &str,
+    nodes: &[NamedNode],
+    mut read: impl FnMut(&NamedNode) -> Result<T, GraphError>,
+) -> Result<Vec<T>, GraphError> {
+    let mut out = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        match read(node) {
+            Ok(value) => out.push(value),
+            Err(e @ GraphError::Storage(_)) => return Err(e),
+            Err(error) => {
+                tracing::warn!(%node, kind, %error, "skipping unreadable stored record");
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub(crate) fn iri(value: String) -> NamedNode {
     NamedNode::new_unchecked(value)
 }

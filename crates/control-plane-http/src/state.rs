@@ -51,7 +51,7 @@ impl AppState {
             data_service_id: SEED_SERVICE_ID.to_string(),
         };
         graph.put_settings(&settings)?;
-        if graph.datasets()?.is_empty() {
+        if graph.dataset_count()? == 0 {
             graph.put_dataset(&seed_dataset(settings.data_service()))?;
         }
         Ok(Self {

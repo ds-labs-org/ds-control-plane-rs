@@ -36,15 +36,13 @@ pub struct App {
 pub async fn build(config: Config) -> anyhow::Result<App> {
     let dsp = &config.dsp_path;
     let state = Arc::new(AppState::open(config.clone())?);
-    let restored = (
-        state.graph.negotiations()?.len(),
-        state.graph.transfers()?.len(),
-    );
+    // Counts by type only: decoding every record here would make startup
+    // O(all records) and let one damaged record stop the server.
     tracing::info!(
         store = ?config.store_path,
-        datasets = state.graph.datasets()?.len(),
-        negotiations = restored.0,
-        transfers = restored.1,
+        datasets = state.graph.dataset_count()?,
+        negotiations = state.graph.negotiation_count()?,
+        transfers = state.graph.transfer_count()?,
         "opened control plane graph"
     );
 

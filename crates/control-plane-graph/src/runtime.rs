@@ -16,7 +16,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::policy::{read_agreement, read_offer, write_agreement, write_offer};
-use crate::store::{ControlPlaneGraph, GraphError, Reader, Writer, iri, lookup_iri};
+use crate::store::{ControlPlaneGraph, GraphError, Reader, Writer, iri, lookup_iri, readable};
 use crate::vocab::{RUNTIME_GRAPH, dcterms, dscp, dspace};
 
 /// A stored record together with when it was last written.
@@ -166,14 +166,20 @@ impl ControlPlaneGraph {
         }
     }
 
-    /// Every stored negotiation, sorted by `providerPid`.
+    /// The number of stored negotiations, without reading them.
+    pub fn negotiation_count(&self) -> Result<usize, GraphError> {
+        self.count(&runtime_graph(), &dspace("ContractNegotiation"))
+    }
+
+    /// Every readable stored negotiation, sorted by `providerPid`. One that
+    /// fails to decode is skipped with a warning.
     pub fn negotiations(&self) -> Result<Vec<Record<ContractNegotiation>>, GraphError> {
         let _guard = self.read_guard();
         let graph = runtime_graph();
         let r = self.reader(&graph);
         let mut nodes = named(r.instances(&dspace("ContractNegotiation"))?);
         nodes.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        nodes.iter().map(|n| read_negotiation(&r, n)).collect()
+        readable("negotiation", &nodes, |n| read_negotiation(&r, n))
     }
 
     /// Stores `negotiation`, replacing any record with the same
@@ -216,14 +222,20 @@ impl ControlPlaneGraph {
         }
     }
 
-    /// Every stored transfer process, sorted by `providerPid`.
+    /// The number of stored transfer processes, without reading them.
+    pub fn transfer_count(&self) -> Result<usize, GraphError> {
+        self.count(&runtime_graph(), &dspace("TransferProcess"))
+    }
+
+    /// Every readable stored transfer process, sorted by `providerPid`. One
+    /// that fails to decode is skipped with a warning.
     pub fn transfers(&self) -> Result<Vec<Record<TransferProcess>>, GraphError> {
         let _guard = self.read_guard();
         let graph = runtime_graph();
         let r = self.reader(&graph);
         let mut nodes = named(r.instances(&dspace("TransferProcess"))?);
         nodes.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        nodes.iter().map(|n| read_transfer(&r, n)).collect()
+        readable("transfer process", &nodes, |n| read_transfer(&r, n))
     }
 
     /// Stores `transfer`, replacing any record with the same `providerPid`.

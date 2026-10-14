@@ -203,6 +203,14 @@ store is in memory as before. RocksDB is oxigraph's `rocksdb` feature,
 a from-source C++ build, on by default through `control-plane-graph`'s
 own `rocksdb` feature. Only one process can hold a store directory open.
 
+**Damaged records:** writes reject id collisions, but a record can still
+come back unreadable (an older release, a hand edit). List reads
+(`datasets()`, `negotiations()`, `transfers()`, and so the catalog and
+the Contreforts pulls) skip such a record with a `tracing::warn` instead
+of failing; a lookup of that one record still returns the error. Startup
+only counts records by `rdf:type` (for its log line and the seeding
+check), so it neither decodes every record nor fails on a damaged one.
+
 **What is settings and what is deployment:** the connector's identity
 (`AGENT_ID`, `BASE_URL`, `DSP_PATH`) describes the deployment, so it comes
 from the environment and is rewritten into the settings graph on every

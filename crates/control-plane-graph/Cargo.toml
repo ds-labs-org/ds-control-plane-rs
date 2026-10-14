@@ -20,6 +20,7 @@ oxigraph = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 chrono = { workspace = true }
 # Not used directly. Keeps a digest-0.11-compatible `sha2` in the build for
 # oxigraph's SPARQL `HASH()` support (`spareval`), so that a crate pulling
