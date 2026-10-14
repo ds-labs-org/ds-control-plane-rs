@@ -26,6 +26,9 @@ anyhow = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# tests/persistence.rs damages a stored record directly, below the graph
+# crate's write checks, to check that startup and listings survive it.
+oxigraph = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 # Runs the real `eclipsedataspacetck/dsp-tck-runtime` container in
 # tests/dsp_tck.rs, same crate this project's sibling ds-sql-dps-rs uses for

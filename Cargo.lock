@@ -441,6 +441,7 @@ dependencies = [
  "control-plane-core",
  "control-plane-graph",
  "futures",
+ "oxigraph",
  "regex",
  "reqwest",
  "serde",

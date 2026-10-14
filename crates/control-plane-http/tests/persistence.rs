@@ -188,3 +188,93 @@ async fn without_a_store_path_nothing_is_kept() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+/// Deletes every `predicate` triple of `subject` straight in the RocksDB
+/// store, below the graph crate's write checks.
+fn corrupt(store: &std::path::Path, subject: &str, predicate: &str) {
+    use oxigraph::model::NamedNode;
+    let store = oxigraph::store::Store::open(store).unwrap();
+    let subject = NamedNode::new(subject).unwrap();
+    let predicate = NamedNode::new(predicate).unwrap();
+    let quads: Vec<_> = store
+        .quads_for_pattern(
+            Some(subject.as_ref().into()),
+            Some(predicate.as_ref()),
+            None,
+            None,
+        )
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(!quads.is_empty(), "nothing to corrupt");
+    for q in quads {
+        store.remove(&q).unwrap();
+    }
+    store.flush().unwrap();
+}
+
+#[tokio::test]
+async fn one_unreadable_record_neither_stops_startup_nor_hides_the_catalog() {
+    use control_plane_core::catalog::{DataService, Dataset, Distribution};
+    use control_plane_core::transfer::TransferProcess;
+    use control_plane_graph::ControlPlaneGraph;
+    use control_plane_graph::vocab::{dcat, dspace};
+
+    let dir = tempfile::tempdir().unwrap();
+    drop(
+        control_plane_http::build(config(dir.path(), "http://before.example"))
+            .await
+            .unwrap(),
+    );
+    {
+        let graph = ControlPlaneGraph::open(dir.path()).unwrap();
+        graph
+            .put_dataset(&Dataset {
+                id: "urn:uuid:broken".to_string(),
+                type_: "Dataset".to_string(),
+                has_policy: vec![],
+                distribution: vec![Distribution {
+                    type_: "Distribution".to_string(),
+                    format: "HttpData-PULL".to_string(),
+                    access_service: DataService {
+                        id: "urn:uuid:svcx".to_string(),
+                        type_: "DataService".to_string(),
+                        endpoint_url: "http://x.example/dsp".to_string(),
+                    },
+                }],
+            })
+            .unwrap();
+        graph
+            .put_transfer(&TransferProcess::new(
+                "urn:uuid:t-bad",
+                "c",
+                "a",
+                "HttpData-PULL",
+            ))
+            .unwrap();
+        graph.flush().unwrap();
+    }
+    corrupt(dir.path(), "urn:uuid:svcx", &dcat("endpointURL"));
+    corrupt(dir.path(), "urn:uuid:t-bad", &dspace("state"));
+
+    let app = control_plane_http::build(config(dir.path(), "http://before.example"))
+        .await
+        .expect("startup must survive one unreadable record");
+    let (status, catalog) = call(
+        &app.router,
+        "POST",
+        "/dsp/2025-1/catalog/request",
+        Some(serde_json::json!({
+            "@context": ["https://w3id.org/dspace/2025/1/context.jsonld"],
+            "@type": "CatalogRequestMessage",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let ids: Vec<_> = catalog["dataset"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["@id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["urn:uuid:control-plane-rs-seed-dataset"]);
+}

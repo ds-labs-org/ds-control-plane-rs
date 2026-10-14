@@ -538,3 +538,92 @@ fn reads_concurrent_with_rewrites_see_whole_records() {
         );
     });
 }
+
+/// Deletes every `predicate` triple of `subject`, bypassing the write
+/// checks, to stand in for a record damaged by a torn write, an older
+/// release or a hand edit.
+fn corrupt(graph: &ControlPlaneGraph, subject: &str, predicate: &str) {
+    let subject = oxigraph::model::NamedNode::new(subject).unwrap();
+    let predicate = oxigraph::model::NamedNode::new(predicate).unwrap();
+    let quads: Vec<_> = graph
+        .store
+        .quads_for_pattern(
+            Some(subject.as_ref().into()),
+            Some(predicate.as_ref()),
+            None,
+            None,
+        )
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(!quads.is_empty(), "nothing to corrupt");
+    for q in quads {
+        graph.store.remove(&q).unwrap();
+    }
+}
+
+#[test]
+fn an_unreadable_record_is_skipped_by_list_reads_but_not_by_lookups() {
+    let s = settings();
+    let graph = ControlPlaneGraph::open_in_memory().unwrap();
+    graph.put_settings(&s).unwrap();
+    graph.put_dataset(&dataset("urn:ds:good", &s)).unwrap();
+    let mut broken = dataset("urn:ds:broken", &s);
+    broken.distribution[0].access_service = DataService {
+        id: "urn:uuid:svcx".to_string(),
+        type_: "DataService".to_string(),
+        endpoint_url: "http://x.example/dsp".to_string(),
+    };
+    graph.put_dataset(&broken).unwrap();
+    corrupt(&graph, "urn:uuid:svcx", &vocab::dcat("endpointURL"));
+
+    let mut good_n = negotiation();
+    good_n.provider_pid = "urn:uuid:n-good".to_string();
+    graph.put_negotiation(&good_n).unwrap();
+    graph.put_negotiation(&negotiation()).unwrap();
+    corrupt(&graph, "urn:uuid:n1", &vocab::dspace("consumerPid"));
+
+    graph
+        .put_transfer(&TransferProcess::new(
+            "urn:uuid:t-good",
+            "c",
+            "a",
+            "HttpData-PULL",
+        ))
+        .unwrap();
+    graph
+        .put_transfer(&TransferProcess::new(
+            "urn:uuid:t-bad",
+            "c",
+            "a",
+            "HttpData-PULL",
+        ))
+        .unwrap();
+    corrupt(&graph, "urn:uuid:t-bad", &vocab::dspace("state"));
+
+    let ids: Vec<_> = graph
+        .datasets()
+        .unwrap()
+        .into_iter()
+        .map(|d| d.id)
+        .collect();
+    assert_eq!(ids, ["urn:ds:good"]);
+    let pids: Vec<_> = graph
+        .negotiations()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.value.provider_pid)
+        .collect();
+    assert_eq!(pids, ["urn:uuid:n-good"]);
+    let pids: Vec<_> = graph
+        .transfers()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.value.provider_pid)
+        .collect();
+    assert_eq!(pids, ["urn:uuid:t-good"]);
+
+    // Single-record lookups still report the damage.
+    assert!(graph.dataset("urn:ds:broken").is_err());
+    assert!(graph.negotiation("urn:uuid:n1").is_err());
+    assert!(graph.transfer("urn:uuid:t-bad").is_err());
+}
