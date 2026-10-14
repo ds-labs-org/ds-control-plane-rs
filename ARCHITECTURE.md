@@ -176,6 +176,11 @@ found") matched with `quads_for_pattern`, and everything else a
 counterparty sends is a plain literal. Each write replaces a record's node
 and the blank nodes under it in one transaction, under a write lock, so
 `update_negotiation`/`update_transfer` are atomic read-modify-writes.
+Getters hold the same lock (an `RwLock`) for reading: Oxigraph takes a new
+snapshot on every `quads_for_pattern`, and a record is decoded with many of
+them, so an unguarded read racing a rewrite could list blank children that
+are already gone and fail with `GraphError::Missing`. Reads run alongside
+each other but wait for an in-flight write.
 Datasets, data services and the settings node share the settings graph, so
 `put_dataset` and `put_settings` first check that no IRI they are about to
 replace is the settings node or already typed as another kind of record

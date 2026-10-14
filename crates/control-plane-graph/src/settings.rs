@@ -129,6 +129,7 @@ fn check_kind(r: &Reader<'_>, node: &NamedNode, class: &str) -> Result<(), Graph
 impl ControlPlaneGraph {
     /// The stored connector settings, or `None` before any were written.
     pub fn settings(&self) -> Result<Option<ConnectorSettings>, GraphError> {
+        let _guard = self.read_guard();
         let graph = settings_graph();
         let r = self.reader(&graph);
         let node = iri(SETTINGS_NODE.to_string());
@@ -149,7 +150,7 @@ impl ControlPlaneGraph {
     /// connector's own data service node so every dataset distribution
     /// pointing at it picks up the new endpoint.
     pub fn put_settings(&self, settings: &ConnectorSettings) -> Result<(), GraphError> {
-        let _guard = self.write_lock.lock().expect("write lock poisoned");
+        let _guard = self.write_guard();
         let graph = settings_graph();
         let node = iri(SETTINGS_NODE.to_string());
         let mut w = Writer::new(&graph);
@@ -169,6 +170,7 @@ impl ControlPlaneGraph {
 
     /// The stored data service `id`, if any.
     pub fn data_service(&self, id: &str) -> Result<Option<DataService>, GraphError> {
+        let _guard = self.read_guard();
         let graph = settings_graph();
         let r = self.reader(&graph);
         let Some(node) = lookup_iri(id) else {
@@ -182,6 +184,7 @@ impl ControlPlaneGraph {
 
     /// Every catalog dataset in the settings graph, sorted by id.
     pub fn datasets(&self) -> Result<Vec<Dataset>, GraphError> {
+        let _guard = self.read_guard();
         let graph = settings_graph();
         let r = self.reader(&graph);
         let mut nodes: Vec<NamedNode> = r
@@ -199,6 +202,7 @@ impl ControlPlaneGraph {
     /// One catalog dataset by `@id`, or `None` if there is no such dataset
     /// (including when `id` is not a valid IRI).
     pub fn dataset(&self, id: &str) -> Result<Option<Dataset>, GraphError> {
+        let _guard = self.read_guard();
         let graph = settings_graph();
         let r = self.reader(&graph);
         let Some(node) = lookup_iri(id) else {
@@ -217,7 +221,7 @@ impl ControlPlaneGraph {
     /// node or a record of another kind, or a data service id equals the
     /// dataset's own.
     pub fn put_dataset(&self, dataset: &Dataset) -> Result<(), GraphError> {
-        let _guard = self.write_lock.lock().expect("write lock poisoned");
+        let _guard = self.write_guard();
         let graph = settings_graph();
         let node = NamedNode::new(&dataset.id)?;
         let r = self.reader(&graph);
@@ -251,7 +255,7 @@ impl ControlPlaneGraph {
 
     /// Removes the dataset `id` from the catalog. Returns whether it existed.
     pub fn remove_dataset(&self, id: &str) -> Result<bool, GraphError> {
-        let _guard = self.write_lock.lock().expect("write lock poisoned");
+        let _guard = self.write_guard();
         let graph = settings_graph();
         let Some(node) = lookup_iri(id) else {
             return Ok(false);

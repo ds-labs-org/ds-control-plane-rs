@@ -11,9 +11,11 @@
 //! node reachable from it are removed and the new triples inserted, in one
 //! transaction, under a process-wide write lock so a read-modify-write
 //! (`update_negotiation`, `update_transfer`) cannot interleave with
-//! another one.
+//! another one. Getters hold the same lock for reading: Oxigraph takes a
+//! new snapshot on every `quads_for_pattern`, so without it a record read
+//! during a rewrite could list blank children that are already gone.
 
-use std::sync::Mutex;
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use oxigraph::model::{
     BlankNode, GraphName, GraphNameRef, Literal, NamedNode, NamedOrBlankNode, NamedOrBlankNodeRef,
@@ -55,7 +57,11 @@ pub enum GraphError {
 /// "Contreforts: settings and runtime persistence".
 pub struct ControlPlaneGraph {
     pub(crate) store: Store,
-    pub(crate) write_lock: Mutex<()>,
+    /// Held for writing by every write and for reading by every public
+    /// getter, so a getter decodes a whole record from one state of the
+    /// store. Oxigraph takes a fresh snapshot per `quads_for_pattern`, and
+    /// a record is read with many of them.
+    lock: RwLock<()>,
 }
 
 impl ControlPlaneGraph {
@@ -65,7 +71,7 @@ impl ControlPlaneGraph {
     pub fn open_in_memory() -> Result<Self, GraphError> {
         Ok(Self {
             store: Store::new()?,
-            write_lock: Mutex::new(()),
+            lock: RwLock::new(()),
         })
     }
 
@@ -76,7 +82,7 @@ impl ControlPlaneGraph {
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, GraphError> {
         Ok(Self {
             store: Store::open(path)?,
-            write_lock: Mutex::new(()),
+            lock: RwLock::new(()),
         })
     }
 
@@ -84,6 +90,18 @@ impl ControlPlaneGraph {
     #[cfg(feature = "rocksdb")]
     pub fn flush(&self) -> Result<(), GraphError> {
         Ok(self.store.flush()?)
+    }
+
+    /// Taken by every public write for its whole duration.
+    pub(crate) fn write_guard(&self) -> RwLockWriteGuard<'_, ()> {
+        self.lock.write().expect("graph lock poisoned")
+    }
+
+    /// Taken by every public getter for its whole duration, so its reads
+    /// never interleave with a write. Never take it while holding either
+    /// guard: `RwLock` is not reentrant.
+    pub(crate) fn read_guard(&self) -> RwLockReadGuard<'_, ()> {
+        self.lock.read().expect("graph lock poisoned")
     }
 
     /// Replaces the record rooted at `root` in `graph` with `quads`

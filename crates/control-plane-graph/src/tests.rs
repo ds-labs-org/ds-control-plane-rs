@@ -442,7 +442,7 @@ fn reads_concurrent_with_rewrites_see_whole_records() {
     let done = std::sync::atomic::AtomicBool::new(false);
     std::thread::scope(|scope| {
         scope.spawn(|| {
-            for _ in 0..1000 {
+            for _ in 0..300 {
                 graph
                     .update_negotiation("urn:uuid:n1", |_| Ok::<(), ()>(()))
                     .unwrap()

@@ -158,6 +158,7 @@ impl ControlPlaneGraph {
         &self,
         provider_pid: &str,
     ) -> Result<Option<ContractNegotiation>, GraphError> {
+        let _guard = self.read_guard();
         let graph = runtime_graph();
         match self.find(provider_pid, &dspace("ContractNegotiation"))? {
             Some(node) => Ok(Some(read_negotiation(&self.reader(&graph), &node)?.value)),
@@ -167,6 +168,7 @@ impl ControlPlaneGraph {
 
     /// Every stored negotiation, sorted by `providerPid`.
     pub fn negotiations(&self) -> Result<Vec<Record<ContractNegotiation>>, GraphError> {
+        let _guard = self.read_guard();
         let graph = runtime_graph();
         let r = self.reader(&graph);
         let mut nodes = named(r.instances(&dspace("ContractNegotiation"))?);
@@ -177,7 +179,7 @@ impl ControlPlaneGraph {
     /// Stores `negotiation`, replacing any record with the same
     /// `providerPid`.
     pub fn put_negotiation(&self, negotiation: &ContractNegotiation) -> Result<(), GraphError> {
-        let _guard = self.write_lock.lock().expect("write lock poisoned");
+        let _guard = self.write_guard();
         let (node, quads) = write_negotiation(negotiation)?;
         self.replace(&runtime_graph(), &node, quads)
     }
@@ -190,7 +192,7 @@ impl ControlPlaneGraph {
         provider_pid: &str,
         f: impl FnOnce(&mut ContractNegotiation) -> Result<R, E>,
     ) -> Result<Option<Result<R, E>>, GraphError> {
-        let _guard = self.write_lock.lock().expect("write lock poisoned");
+        let _guard = self.write_guard();
         let graph = runtime_graph();
         let Some(node) = self.find(provider_pid, &dspace("ContractNegotiation"))? else {
             return Ok(None);
@@ -206,6 +208,7 @@ impl ControlPlaneGraph {
 
     /// The transfer process `provider_pid`, or `None` if there is none.
     pub fn transfer(&self, provider_pid: &str) -> Result<Option<TransferProcess>, GraphError> {
+        let _guard = self.read_guard();
         let graph = runtime_graph();
         match self.find(provider_pid, &dspace("TransferProcess"))? {
             Some(node) => Ok(Some(read_transfer(&self.reader(&graph), &node)?.value)),
@@ -215,6 +218,7 @@ impl ControlPlaneGraph {
 
     /// Every stored transfer process, sorted by `providerPid`.
     pub fn transfers(&self) -> Result<Vec<Record<TransferProcess>>, GraphError> {
+        let _guard = self.read_guard();
         let graph = runtime_graph();
         let r = self.reader(&graph);
         let mut nodes = named(r.instances(&dspace("TransferProcess"))?);
@@ -224,7 +228,7 @@ impl ControlPlaneGraph {
 
     /// Stores `transfer`, replacing any record with the same `providerPid`.
     pub fn put_transfer(&self, transfer: &TransferProcess) -> Result<(), GraphError> {
-        let _guard = self.write_lock.lock().expect("write lock poisoned");
+        let _guard = self.write_guard();
         let (node, quads) = write_transfer(transfer)?;
         self.replace(&runtime_graph(), &node, quads)
     }
@@ -235,7 +239,7 @@ impl ControlPlaneGraph {
         provider_pid: &str,
         f: impl FnOnce(&mut TransferProcess) -> Result<R, E>,
     ) -> Result<Option<Result<R, E>>, GraphError> {
-        let _guard = self.write_lock.lock().expect("write lock poisoned");
+        let _guard = self.write_guard();
         let graph = runtime_graph();
         let Some(node) = self.find(provider_pid, &dspace("TransferProcess"))? else {
             return Ok(None);
