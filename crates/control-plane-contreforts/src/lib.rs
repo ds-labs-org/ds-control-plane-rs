@@ -467,4 +467,20 @@ mod tests {
             other => panic!("expected UnsupportedKind, got {other:?}"),
         }
     }
+
+    #[tokio::test]
+    async fn writing_an_undeclared_kind_is_unsupported_kind() {
+        let connector = ControlPlaneConnector::new(graph());
+        let mut doc = dataset_doc("urn:uuid:ds");
+        doc.kind = EntityKind::CUSTOMER;
+        for result in [connector.push(&doc).await, connector.update(&doc).await] {
+            match result {
+                Err(ConnectorError::UnsupportedKind { connector, kind }) => {
+                    assert_eq!(connector, SOURCE);
+                    assert_eq!(kind, "customer");
+                }
+                other => panic!("expected UnsupportedKind, got {other:?}"),
+            }
+        }
+    }
 }
