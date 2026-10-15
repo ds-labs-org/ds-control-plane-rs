@@ -235,11 +235,20 @@ checked against Contreforts' real SHACL meta-shapes and lints by
 here has been run against a real Contreforts deployment
 (`contreforts-product` is private).
 
-**Not addressed here:** the runtime graph grows without bound, as the
-`HashMap`s did, but now on disk; a counterparty allowed to call
-`negotiations/request` can keep adding records. `ds-identity-hub-rs` caps
-its equivalent structures with oldest-first eviction; the same is worth
-doing here before this runs anywhere exposed.
+**Bounded runtime graph:** anyone who can reach `negotiations/request` or
+`transfers/request` adds a record, and with RocksDB it stays on disk, so
+the runtime graph is capped the way `ds-identity-hub-rs` caps its
+equivalent structures: `put_negotiation`/`put_transfer` keep at most
+`MAX_NEGOTIATIONS`/`MAX_TRANSFERS` (2048 each) and, inside the same write
+lock, evict the least recently modified records (by `dcterms:modified`)
+with every blank node under them. Each record is bounded too: an offer
+from a counterparty may carry at most `MAX_RULES_PER_OFFER` (64) rules,
+`MAX_CONSTRAINTS_PER_RULE` (32) constraints per rule and a
+`MAX_OPERAND_BYTES` (4 KiB) `rightOperand`, or the request is a 400 and
+nothing is written; every route takes at most `MAX_BODY_BYTES` (256 KiB)
+of body (`crates/control-plane-http/tests/request_limits.rs`). Still not
+checked: that an offer's `target` or a transfer's `agreementId` names
+something this connector actually holds (the stub policy accepts any).
 
 ## TCK conformance snapshot
 

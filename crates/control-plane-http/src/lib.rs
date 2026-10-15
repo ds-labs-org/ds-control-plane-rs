@@ -17,10 +17,16 @@ pub mod transfer;
 use std::sync::Arc;
 
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 
 use crate::config::Config;
 use crate::state::AppState;
+
+/// The largest request body any route accepts. Every DSP message is a
+/// small JSON-LD document; axum's own 2 MB default let one request carry
+/// an offer large enough to hold the store's write lock for seconds.
+pub const MAX_BODY_BYTES: usize = 256 * 1024;
 
 /// The fully assembled application: the listener already bound and the
 /// axum router fully built, ready to hand to [`serve`].
@@ -107,6 +113,7 @@ pub async fn build(config: Config) -> anyhow::Result<App> {
             &format!("{dsp}/transfers/{{provider_pid}}/suspension"),
             post(transfer::suspend_transfer),
         )
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", config.port);

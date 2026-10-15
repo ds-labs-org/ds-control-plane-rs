@@ -16,9 +16,72 @@ use control_plane_core::negotiation::{
     NegotiationEventType, NegotiationState,
 };
 
+use control_plane_core::common::Offer;
 use control_plane_graph::GraphError;
 
 use crate::state::AppState;
+
+/// The most rules (`permission`, `prohibition` and `obligation` together)
+/// an offer from a counterparty may carry. Each rule is stored as several
+/// triples, so this and the two limits below bound what one request can
+/// make the store hold; real offers carry a handful.
+pub const MAX_RULES_PER_OFFER: usize = 64;
+
+/// The most constraints one rule of a counterparty's offer may carry.
+pub const MAX_CONSTRAINTS_PER_RULE: usize = 32;
+
+/// The largest `rightOperand`, as serialized JSON, a counterparty's offer
+/// may carry.
+pub const MAX_OPERAND_BYTES: usize = 4096;
+
+/// Why `offer` is too large to store, or `None` if it is within the
+/// limits above.
+fn oversized(offer: &Offer) -> Option<String> {
+    let rules = || {
+        offer
+            .permission
+            .iter()
+            .chain(&offer.prohibition)
+            .chain(&offer.obligation)
+    };
+    if rules().count() > MAX_RULES_PER_OFFER {
+        return Some(format!(
+            "an offer may carry at most {MAX_RULES_PER_OFFER} rules"
+        ));
+    }
+    for rule in rules() {
+        if rule.constraint.len() > MAX_CONSTRAINTS_PER_RULE {
+            return Some(format!(
+                "a rule may carry at most {MAX_CONSTRAINTS_PER_RULE} constraints"
+            ));
+        }
+        for c in &rule.constraint {
+            if c.right_operand.to_string().len() > MAX_OPERAND_BYTES {
+                return Some(format!(
+                    "a rightOperand may be at most {MAX_OPERAND_BYTES} bytes"
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn rejected_offer(
+    provider_pid: Option<&str>,
+    consumer_pid: &str,
+    reason: String,
+) -> axum::response::Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ContractNegotiationError::new(
+            provider_pid.map(str::to_string),
+            Some(consumer_pid.to_string()),
+            "400",
+            reason,
+        )),
+    )
+        .into_response()
+}
 
 fn not_found(provider_pid: &str) -> impl IntoResponse {
     (
@@ -98,11 +161,15 @@ pub async fn get_negotiation(
 
 /// `POST {dsp}/negotiations/request` — initiates a new negotiation,
 /// `REQUESTED`. Always accepted: this bootstrap's stub policy never
-/// rejects an offer at this stage (see `../../../ARCHITECTURE.md`).
+/// rejects an offer at this stage (see `../../../ARCHITECTURE.md`), unless
+/// it is past the size limits above.
 pub async fn initiate_negotiation(
     State(state): State<Arc<AppState>>,
     Json(msg): Json<ContractRequestMessage>,
 ) -> impl IntoResponse {
+    if let Some(reason) = oversized(&msg.offer) {
+        return rejected_offer(None, &msg.consumer_pid, reason);
+    }
     let provider_pid = format!("urn:uuid:{}", uuid::Uuid::new_v4());
     let mut negotiation = ContractNegotiation::new(provider_pid, msg.consumer_pid.clone());
     negotiation.dataset_id = msg.offer.target.clone();
@@ -123,6 +190,9 @@ pub async fn continue_negotiation(
     Path(provider_pid): Path<String>,
     Json(msg): Json<ContractRequestMessage>,
 ) -> impl IntoResponse {
+    if let Some(reason) = oversized(&msg.offer) {
+        return rejected_offer(Some(&provider_pid), &msg.consumer_pid, reason);
+    }
     let result = state.graph.update_negotiation(&provider_pid, |n| {
         n.offer = Some(msg.offer);
         Ok::<(), ()>(())

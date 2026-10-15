@@ -154,6 +154,46 @@ impl ControlPlaneGraph {
         Ok(())
     }
 
+    /// Once `graph` holds more than `max` instances of `class`, removes the
+    /// least recently modified ones (by `dcterms:modified`, then IRI) and
+    /// everything reachable from them, back down to `max`, in one
+    /// transaction. A record whose timestamp is unreadable counts as the
+    /// oldest. Callers hold the write guard.
+    pub(crate) fn evict_oldest(
+        &self,
+        graph: &NamedNode,
+        class: &str,
+        max: usize,
+    ) -> Result<(), GraphError> {
+        let r = self.reader(graph);
+        let nodes = r.instances(class)?;
+        if nodes.len() <= max {
+            return Ok(());
+        }
+        let modified = crate::vocab::dcterms("modified");
+        let mut aged = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            let at = match r.date_time(node.as_ref(), &modified) {
+                Ok(at) => at,
+                Err(e @ GraphError::Storage(_)) => return Err(e),
+                Err(_) => chrono::DateTime::<chrono::Utc>::MIN_UTC,
+            };
+            aged.push((at, node));
+        }
+        aged.sort_by(|(a, x), (b, y)| a.cmp(b).then_with(|| x.to_string().cmp(&y.to_string())));
+        let excess = aged.len() - max;
+        let mut old = Vec::new();
+        for (_, node) in aged.into_iter().take(excess) {
+            old.extend(self.tree(graph, node.as_ref())?);
+        }
+        let mut transaction = self.store.start_transaction()?;
+        for quad in &old {
+            transaction.remove(quad);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Every quad in `graph` whose subject is `node` or a blank node
     /// reachable from it.
     fn tree(

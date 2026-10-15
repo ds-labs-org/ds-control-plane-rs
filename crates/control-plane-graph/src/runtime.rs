@@ -194,11 +194,14 @@ impl ControlPlaneGraph {
     }
 
     /// Stores `negotiation`, replacing any record with the same
-    /// `providerPid`.
+    /// `providerPid`, then evicts the least recently modified negotiations
+    /// past [`MAX_NEGOTIATIONS`].
     pub fn put_negotiation(&self, negotiation: &ContractNegotiation) -> Result<(), GraphError> {
         let _guard = self.write_guard();
         let (node, quads) = write_negotiation(negotiation)?;
-        self.replace(&runtime_graph(), &node, quads)
+        let graph = runtime_graph();
+        self.replace(&graph, &node, quads)?;
+        self.evict_oldest(&graph, &dspace("ContractNegotiation"), MAX_NEGOTIATIONS)
     }
 
     /// Reads the negotiation `provider_pid`, applies `f`, and writes it back
@@ -249,11 +252,15 @@ impl ControlPlaneGraph {
         readable("transfer process", &nodes, |n| read_transfer(&r, n))
     }
 
-    /// Stores `transfer`, replacing any record with the same `providerPid`.
+    /// Stores `transfer`, replacing any record with the same `providerPid`,
+    /// then evicts the least recently modified transfers past
+    /// [`MAX_TRANSFERS`].
     pub fn put_transfer(&self, transfer: &TransferProcess) -> Result<(), GraphError> {
         let _guard = self.write_guard();
         let (node, quads) = write_transfer(transfer)?;
-        self.replace(&runtime_graph(), &node, quads)
+        let graph = runtime_graph();
+        self.replace(&graph, &node, quads)?;
+        self.evict_oldest(&graph, &dspace("TransferProcess"), MAX_TRANSFERS)
     }
 
     /// Same as [`Self::update_negotiation`], for a transfer process.
