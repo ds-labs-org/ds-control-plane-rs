@@ -137,7 +137,12 @@ impl ControlPlaneConnector {
         }
     }
 
+    /// Only datasets are writable: an undeclared kind is `UnsupportedKind`,
+    /// a declared read-only kind (negotiation, transfer) is `Unsupported`.
     fn dataset_of(&self, doc: &Document) -> Result<Dataset, ConnectorError> {
+        if !KINDS.contains(&doc.kind.as_str()) {
+            return Err(self.unsupported_kind(&doc.kind));
+        }
         if doc.kind.as_str() != DATASET_KIND {
             return Err(ConnectorError::Unsupported {
                 connector: self.source_name().to_string(),
