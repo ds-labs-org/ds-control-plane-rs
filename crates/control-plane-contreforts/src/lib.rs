@@ -456,6 +456,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_and_pull_agree_on_modified_and_datasets_honour_since() {
+        let connector = ControlPlaneConnector::new(graph());
+        for (kind, id) in [
+            (NEGOTIATION_KIND, "urn:uuid:n1"),
+            (TRANSFER_KIND, "urn:uuid:t1"),
+        ] {
+            let kind = EntityKind::new(kind);
+            let pulled = connector.pull(kind.clone(), None).await.unwrap();
+            let got = connector.get(kind, id).await.unwrap();
+            assert!(got.modified.is_some(), "{id}");
+            assert_eq!(got.modified, pulled[0].modified, "{id}");
+        }
+
+        connector.push(&dataset_doc("urn:uuid:ds")).await.unwrap();
+        let kind = EntityKind::new(DATASET_KIND);
+        let got = connector.get(kind.clone(), "urn:uuid:ds").await.unwrap();
+        let pulled = connector.pull(kind.clone(), None).await.unwrap();
+        assert!(got.modified.is_some());
+        assert_eq!(got.modified, pulled[0].modified);
+        let future = (chrono::Utc::now() + chrono::Duration::hours(1)).naive_utc();
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1)).naive_utc();
+        assert!(
+            connector
+                .pull(kind.clone(), Some(future))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(connector.pull(kind, Some(past)).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn unknown_ids_and_kinds_error() {
         let connector = ControlPlaneConnector::new(graph());
         assert!(matches!(
