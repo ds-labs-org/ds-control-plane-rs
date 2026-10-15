@@ -399,6 +399,122 @@ mod tests {
         assert_eq!(updated.fields["distribution"][0]["format"], "OTHER");
     }
 
+    fn with_service(mut doc: Document, service_id: &str, endpoint: &str) -> Document {
+        doc.fields["distribution"][0]["accessService"]["@id"] = serde_json::json!(service_id);
+        doc.fields["distribution"][0]["accessService"]["endpointURL"] = serde_json::json!(endpoint);
+        doc
+    }
+
+    #[tokio::test]
+    async fn push_sharing_a_service_with_another_endpoint_is_rejected_and_changes_nothing() {
+        let graph = graph();
+        let connector = ControlPlaneConnector::new(graph.clone());
+        let first = with_service(
+            dataset_doc("urn:uuid:ds1"),
+            "urn:uuid:shared",
+            "http://a.example/dsp",
+        );
+        connector.push(&first).await.unwrap();
+        let before = serde_json::to_value(graph.datasets().unwrap()).unwrap();
+
+        let second = with_service(
+            dataset_doc("urn:uuid:ds2"),
+            "urn:uuid:shared",
+            "http://b.example/dsp",
+        );
+        let result = connector.push(&second).await;
+        assert!(
+            matches!(result, Err(ConnectorError::Config(_))),
+            "{result:?}"
+        );
+        assert_eq!(
+            serde_json::to_value(graph.datasets().unwrap()).unwrap(),
+            before
+        );
+        let got = connector
+            .get(EntityKind::new(DATASET_KIND), "urn:uuid:ds1")
+            .await
+            .unwrap();
+        assert_eq!(got.fields, first.fields);
+        assert!(graph.dataset("urn:uuid:ds2").unwrap().is_none());
+
+        // The same service with the same endpoint is shared, not rejected.
+        let third = with_service(
+            dataset_doc("urn:uuid:ds3"),
+            "urn:uuid:shared",
+            "http://a.example/dsp",
+        );
+        connector.push(&third).await.unwrap();
+        let pulled = connector
+            .pull(EntityKind::new(DATASET_KIND), None)
+            .await
+            .unwrap();
+        assert_eq!(pulled.len(), 2);
+        for doc in pulled {
+            assert_eq!(
+                doc.fields["distribution"][0]["accessService"]["endpointURL"],
+                "http://a.example/dsp"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_replaces_the_stored_dataset() {
+        let graph = graph();
+        let connector = ControlPlaneConnector::new(graph.clone());
+        connector.push(&dataset_doc("urn:uuid:ds")).await.unwrap();
+
+        let mut doc = dataset_doc("urn:uuid:ds");
+        doc.fields["hasPolicy"][0]["permission"][0]["action"] = serde_json::json!("read");
+        connector.update(&doc).await.unwrap();
+
+        let got = connector
+            .get(EntityKind::new(DATASET_KIND), "urn:uuid:ds")
+            .await
+            .unwrap();
+        assert_eq!(got.fields, doc.fields);
+        let stored = serde_json::to_value(graph.dataset("urn:uuid:ds").unwrap().unwrap()).unwrap();
+        assert_eq!(stored, doc.fields);
+    }
+
+    #[tokio::test]
+    async fn pull_since_a_watermark_returns_exactly_what_changed_after_it() {
+        let graph = graph();
+        graph
+            .put_transfer(&TransferProcess::new(
+                "urn:uuid:t2",
+                "urn:uuid:c2",
+                "urn:uuid:a2",
+                "HttpData-PULL",
+            ))
+            .unwrap();
+        let connector = ControlPlaneConnector::new(graph.clone());
+        let kind = EntityKind::new(TRANSFER_KIND);
+        let watermark = chrono::Utc::now().naive_utc();
+        assert!(
+            connector
+                .pull(kind.clone(), Some(watermark))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        graph
+            .update_transfer("urn:uuid:t2", |t| {
+                t.format = "HttpData-PUSH".to_string();
+                Ok::<_, ()>(())
+            })
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        let pulled = connector.pull(kind, Some(watermark)).await.unwrap();
+        assert_eq!(pulled.len(), 1, "{pulled:?}");
+        assert_eq!(pulled[0].remote_id, "urn:uuid:t2");
+        assert_eq!(pulled[0].fields["format"], "HttpData-PUSH");
+        assert!(pulled[0].modified.unwrap() > watermark);
+    }
+
     #[tokio::test]
     async fn update_rejects_a_mismatched_id() {
         let connector = ControlPlaneConnector::new(graph());
