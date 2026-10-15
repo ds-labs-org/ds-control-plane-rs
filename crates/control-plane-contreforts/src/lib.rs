@@ -54,13 +54,16 @@ fn not_found(kind: &EntityKind, id: &str) -> ConnectorError {
     }
 }
 
-fn dataset_document(dataset: Dataset) -> Result<Document, ConnectorError> {
+fn dataset_document(
+    dataset: Dataset,
+    modified: Option<NaiveDateTime>,
+) -> Result<Document, ConnectorError> {
     Ok(Document {
         name: dataset.id.clone(),
         remote_id: dataset.id.clone(),
         kind: EntityKind::new(DATASET_KIND),
         source: SOURCE.to_string(),
-        modified: None,
+        modified,
         fields: serde_json::to_value(dataset)?,
     })
 }
@@ -163,20 +166,15 @@ impl ContrefortsConnector for ControlPlaneConnector {
         include_str!("declaration.ttl")
     }
 
-    /// Datasets carry no modification time, so `since` does not filter
-    /// them: every pull returns the whole catalog.
+    /// Every kind carries `dcterms:modified`, which `since` filters on.
     async fn pull(
         &self,
         kind: EntityKind,
         since: Option<NaiveDateTime>,
     ) -> Result<Vec<Document>, ConnectorError> {
         match kind.as_str() {
-            DATASET_KIND => self
-                .graph
-                .datasets()
-                .map_err(to_api_err)?
-                .into_iter()
-                .map(dataset_document)
+            DATASET_KIND => changed_since(self.graph.dataset_records().map_err(to_api_err)?, since)
+                .map(|(d, m)| dataset_document(d, Some(m)))
                 .collect(),
             NEGOTIATION_KIND => {
                 changed_since(self.graph.negotiations().map_err(to_api_err)?, since)
@@ -192,26 +190,30 @@ impl ContrefortsConnector for ControlPlaneConnector {
 
     async fn get(&self, kind: EntityKind, remote_id: &str) -> Result<Document, ConnectorError> {
         match kind.as_str() {
-            DATASET_KIND => dataset_document(
-                self.graph
-                    .dataset(remote_id)
+            DATASET_KIND => {
+                let r = self
+                    .graph
+                    .dataset_record(remote_id)
                     .map_err(to_api_err)?
-                    .ok_or_else(|| not_found(&kind, remote_id))?,
-            ),
-            NEGOTIATION_KIND => negotiation_document(
-                self.graph
-                    .negotiation(remote_id)
+                    .ok_or_else(|| not_found(&kind, remote_id))?;
+                dataset_document(r.value, Some(r.modified.naive_utc()))
+            }
+            NEGOTIATION_KIND => {
+                let r = self
+                    .graph
+                    .negotiation_record(remote_id)
                     .map_err(to_api_err)?
-                    .ok_or_else(|| not_found(&kind, remote_id))?,
-                None,
-            ),
-            TRANSFER_KIND => transfer_document(
-                self.graph
-                    .transfer(remote_id)
+                    .ok_or_else(|| not_found(&kind, remote_id))?;
+                negotiation_document(r.value, Some(r.modified.naive_utc()))
+            }
+            TRANSFER_KIND => {
+                let r = self
+                    .graph
+                    .transfer_record(remote_id)
                     .map_err(to_api_err)?
-                    .ok_or_else(|| not_found(&kind, remote_id))?,
-                None,
-            ),
+                    .ok_or_else(|| not_found(&kind, remote_id))?;
+                transfer_document(r.value, Some(r.modified.naive_utc()))
+            }
             _ => Err(self.unsupported_kind(&kind)),
         }
     }
@@ -232,7 +234,7 @@ impl ContrefortsConnector for ControlPlaneConnector {
                 dataset.id
             )));
         }
-        dataset_document(dataset)
+        self.get(EntityKind::new(DATASET_KIND), &dataset.id).await
     }
 
     /// Replaces the dataset `doc.remote_id` with `doc.fields`, whose `@id`
@@ -255,7 +257,7 @@ impl ContrefortsConnector for ControlPlaneConnector {
         {
             return Err(not_found(&doc.kind, &doc.remote_id));
         }
-        dataset_document(dataset)
+        self.get(EntityKind::new(DATASET_KIND), &dataset.id).await
     }
 }
 

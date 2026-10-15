@@ -149,8 +149,10 @@ separates configuration from synced data:
 - **Settings graph** (`urn:ds-control-plane-rs:graph:settings`): the
   connector's identity (`dspace:participantId`, base URL, DSP path, catalog
   id, its own `dcat:DataService` and `dcat:endpointURL`) and every catalog
-  dataset as a `dcat:Dataset` with its ODRL offers (`odrl:hasPolicy`) and
-  `dcat:Distribution`s. Datasets and data services are named by their own
+  dataset as a `dcat:Dataset` with its ODRL offers (`odrl:hasPolicy`),
+  `dcat:Distribution`s and a `dcterms:modified` timestamp (a dataset
+  stored before datasets were timestamped reads as modified at the Unix
+  epoch). Datasets and data services are named by their own
   `@id` IRIs, so the graph is SPARQL-addressable by the same ids the
   catalog serves. Distributions point at their data service by IRI, so a
   new base URL rewrites one `dcat:endpointURL` triple, not every dataset.
@@ -235,7 +237,7 @@ driver can resolve each back to its class:
 
 | Kind | Graph | `pull`/`get` | `push`/`update` |
 |---|---|---|---|
-| `ds-control-plane-rs:dataset` | settings | yes | `push` adds a new catalog dataset (an existing id is a `Config` error); `update` replaces an existing one (an unknown id is `NotFound`) |
+| `ds-control-plane-rs:dataset` | settings | yes, `since` filters on `dcterms:modified` | `push` adds a new catalog dataset (an existing id is a `Config` error); `update` replaces an existing one (an unknown id is `NotFound`) |
 | `ds-control-plane-rs:contract-negotiation` | runtime | yes, `since` filters on `dcterms:modified` | unsupported |
 | `ds-control-plane-rs:transfer-process` | runtime | yes, `since` filters on `dcterms:modified` | unsupported |
 

@@ -684,3 +684,21 @@ fn an_unreadable_record_is_skipped_by_list_reads_but_not_by_lookups() {
     assert!(graph.negotiation("urn:uuid:n1").is_err());
     assert!(graph.transfer("urn:uuid:t-bad").is_err());
 }
+
+#[test]
+fn a_dataset_stored_without_modified_still_reads_as_unchanged_since_the_epoch() {
+    let s = settings();
+    let graph = ControlPlaneGraph::open_in_memory().unwrap();
+    graph.put_dataset(&dataset("urn:uuid:legacy", &s)).unwrap();
+    assert!(graph.dataset_records().unwrap()[0].modified > chrono::DateTime::UNIX_EPOCH);
+
+    corrupt(
+        &graph,
+        "urn:uuid:legacy",
+        &crate::vocab::dcterms("modified"),
+    );
+    let records = graph.dataset_records().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].modified, chrono::DateTime::UNIX_EPOCH);
+    assert!(graph.dataset("urn:uuid:legacy").unwrap().is_some());
+}

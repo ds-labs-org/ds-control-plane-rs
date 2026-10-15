@@ -9,10 +9,13 @@
 
 use std::collections::HashMap;
 
+use chrono::Utc;
+
 use control_plane_core::catalog::{DataService, Dataset, Distribution};
 use oxigraph::model::{Literal, NamedNode, NamedOrBlankNode, NamedOrBlankNodeRef, Term};
 
 use crate::policy::{read_offer, write_offer};
+use crate::runtime::Record;
 use crate::store::{ControlPlaneGraph, GraphError, Reader, Writer, iri, lookup_iri, readable};
 use crate::vocab::{SETTINGS_GRAPH, SETTINGS_NODE, dcat, dcterms, dscp, dspace, odrl, xsd};
 
@@ -71,7 +74,7 @@ fn read_data_service(r: &Reader<'_>, node: &NamedNode) -> Result<DataService, Gr
     })
 }
 
-fn read_dataset(r: &Reader<'_>, node: &NamedNode) -> Result<Dataset, GraphError> {
+fn read_dataset(r: &Reader<'_>, node: &NamedNode) -> Result<Record<Dataset>, GraphError> {
     let subject: NamedOrBlankNodeRef<'_> = node.as_ref().into();
     let mut has_policy = Vec::new();
     for offer in r.ordered_children(subject, &odrl("hasPolicy"))? {
@@ -98,11 +101,20 @@ fn read_dataset(r: &Reader<'_>, node: &NamedNode) -> Result<Dataset, GraphError>
             access_service: read_data_service(r, &service)?,
         });
     }
-    Ok(Dataset {
-        id: node.as_str().to_string(),
-        type_: "Dataset".to_string(),
-        has_policy,
-        distribution,
+    Ok(Record {
+        value: Dataset {
+            id: node.as_str().to_string(),
+            type_: "Dataset".to_string(),
+            has_policy,
+            distribution,
+        },
+        // Datasets stored before they were timestamped have no
+        // `dcterms:modified`; they count as unchanged since the epoch rather
+        // than unreadable, so an existing store keeps its catalog.
+        modified: match r.opt_str(subject, &dcterms("modified"))? {
+            Some(_) => r.date_time(subject, &dcterms("modified"))?,
+            None => chrono::DateTime::UNIX_EPOCH,
+        },
     })
 }
 
@@ -193,6 +205,15 @@ impl ControlPlaneGraph {
     /// A dataset that fails to decode is skipped with a warning; look it up
     /// with [`Self::dataset`] to see why.
     pub fn datasets(&self) -> Result<Vec<Dataset>, GraphError> {
+        Ok(self
+            .dataset_records()?
+            .into_iter()
+            .map(|r| r.value)
+            .collect())
+    }
+
+    /// [`Self::datasets`] with each one's `dcterms:modified` time.
+    pub fn dataset_records(&self) -> Result<Vec<Record<Dataset>>, GraphError> {
         let _guard = self.read_guard();
         let graph = settings_graph();
         let r = self.reader(&graph);
@@ -211,6 +232,11 @@ impl ControlPlaneGraph {
     /// One catalog dataset by `@id`, or `None` if there is no such dataset
     /// (including when `id` is not a valid IRI).
     pub fn dataset(&self, id: &str) -> Result<Option<Dataset>, GraphError> {
+        Ok(self.dataset_record(id)?.map(|r| r.value))
+    }
+
+    /// [`Self::dataset`] with its `dcterms:modified` time.
+    pub fn dataset_record(&self, id: &str) -> Result<Option<Record<Dataset>>, GraphError> {
         let _guard = self.read_guard();
         let graph = settings_graph();
         let r = self.reader(&graph);
@@ -277,6 +303,7 @@ impl ControlPlaneGraph {
         check_kind(&r, &node, &dcat("Dataset"))?;
         let mut w = Writer::new(&graph);
         w.add_type(node.clone(), dcat("Dataset"));
+        w.add_date_time(node.clone(), dcterms("modified"), Utc::now());
         for (i, offer) in dataset.has_policy.iter().enumerate() {
             write_offer(&mut w, node.clone(), odrl("hasPolicy"), i, offer);
         }

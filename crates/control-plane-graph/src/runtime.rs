@@ -169,10 +169,18 @@ impl ControlPlaneGraph {
         &self,
         provider_pid: &str,
     ) -> Result<Option<ContractNegotiation>, GraphError> {
+        Ok(self.negotiation_record(provider_pid)?.map(|r| r.value))
+    }
+
+    /// [`Self::negotiation`] with its `dcterms:modified` time.
+    pub fn negotiation_record(
+        &self,
+        provider_pid: &str,
+    ) -> Result<Option<Record<ContractNegotiation>>, GraphError> {
         let _guard = self.read_guard();
         let graph = runtime_graph();
         match self.find(provider_pid, &dspace("ContractNegotiation"))? {
-            Some(node) => Ok(Some(read_negotiation(&self.reader(&graph), &node)?.value)),
+            Some(node) => Ok(Some(read_negotiation(&self.reader(&graph), &node)?)),
             None => Ok(None),
         }
     }
@@ -228,10 +236,18 @@ impl ControlPlaneGraph {
 
     /// The transfer process `provider_pid`, or `None` if there is none.
     pub fn transfer(&self, provider_pid: &str) -> Result<Option<TransferProcess>, GraphError> {
+        Ok(self.transfer_record(provider_pid)?.map(|r| r.value))
+    }
+
+    /// [`Self::transfer`] with its `dcterms:modified` time.
+    pub fn transfer_record(
+        &self,
+        provider_pid: &str,
+    ) -> Result<Option<Record<TransferProcess>>, GraphError> {
         let _guard = self.read_guard();
         let graph = runtime_graph();
         match self.find(provider_pid, &dspace("TransferProcess"))? {
-            Some(node) => Ok(Some(read_transfer(&self.reader(&graph), &node)?.value)),
+            Some(node) => Ok(Some(read_transfer(&self.reader(&graph), &node)?)),
             None => Ok(None),
         }
     }
