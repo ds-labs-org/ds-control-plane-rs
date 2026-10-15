@@ -31,7 +31,7 @@ pub async fn catalog_request(
     if let Some(Json(msg)) = &body {
         tracing::debug!(filter = ?msg.filter, "catalog request received");
     }
-    match state.catalog() {
+    match state.catalog().await {
         Ok(catalog) => (StatusCode::OK, Json(catalog)).into_response(),
         Err(e) => store_error(e),
     }
@@ -42,7 +42,8 @@ pub async fn dataset_request(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match state.graph.dataset(&id) {
+    let lookup = id.clone();
+    match state.with_graph(move |g| g.dataset(&lookup)).await {
         Ok(Some(dataset)) => (StatusCode::OK, Json(DatasetDocument::from(dataset))).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,

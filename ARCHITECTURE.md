@@ -180,7 +180,11 @@ Getters hold the same lock (an `RwLock`) for reading: Oxigraph takes a new
 snapshot on every `quads_for_pattern`, and a record is decoded with many of
 them, so an unguarded read racing a rewrite could list blank children that
 are already gone and fail with `GraphError::Missing`. Reads run alongside
-each other but wait for an in-flight write.
+each other but wait for an in-flight write. Since every graph call
+blocks, HTTP handlers make them through `AppState::with_graph`, which runs
+them on Tokio's blocking pool: a handler waiting on the lock or on a
+RocksDB commit never parks a worker thread, so requests that don't touch
+the store are still served while it is busy.
 Datasets, data services and the settings node share the settings graph, so
 `put_dataset` and `put_settings` first check that no IRI they are about to
 replace is the settings node or already typed as another kind of record

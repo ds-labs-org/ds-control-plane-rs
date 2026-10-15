@@ -66,7 +66,8 @@ pub async fn get_transfer(
     State(state): State<Arc<AppState>>,
     Path(provider_pid): Path<String>,
 ) -> impl IntoResponse {
-    match state.graph.transfer(&provider_pid) {
+    let lookup = provider_pid.clone();
+    match state.with_graph(move |g| g.transfer(&lookup)).await {
         Ok(Some(t)) => (StatusCode::OK, Json(t.to_ack())).into_response(),
         Ok(None) => not_found(&provider_pid).into_response(),
         Err(e) => store_error(Some(&provider_pid), e),
@@ -87,7 +88,8 @@ pub async fn initiate_transfer(
         msg.agreement_id,
         msg.format,
     );
-    match state.graph.put_transfer(&transfer) {
+    let stored = transfer.clone();
+    match state.with_graph(move |g| g.put_transfer(&stored)).await {
         Ok(()) => (StatusCode::CREATED, Json(transfer.to_ack())).into_response(),
         Err(e) => store_error(None, e),
     }
@@ -134,10 +136,15 @@ async fn transition(
     provider_pid: &str,
     to: TransferState,
 ) -> axum::response::Response {
-    let result = state.graph.update_transfer(provider_pid, |t| {
-        let from = t.state;
-        t.transition(to).map_err(|_| (from, t.consumer_pid.clone()))
-    });
+    let pid = provider_pid.to_string();
+    let result = state
+        .with_graph(move |g| {
+            g.update_transfer(&pid, |t| {
+                let from = t.state;
+                t.transition(to).map_err(|_| (from, t.consumer_pid.clone()))
+            })
+        })
+        .await;
     match result {
         Ok(Some(Ok(()))) => StatusCode::OK.into_response(),
         Ok(Some(Err((from, consumer_pid)))) => {

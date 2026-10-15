@@ -67,15 +67,33 @@ impl AppState {
         self.settings.data_service()
     }
 
+    /// Runs `f` against the graph on Tokio's blocking pool. Every graph
+    /// call is synchronous: a write waits on the store's write lock and
+    /// then commits (to RocksDB when persistent), and a read waits on the
+    /// same lock while a write holds it. Called directly from a handler,
+    /// that wait parks the whole worker thread, and once every worker is
+    /// parked no request is served, even one that never touches the store.
+    /// A panic in `f` is resumed in the caller.
+    pub async fn with_graph<R: Send + 'static>(
+        &self,
+        f: impl FnOnce(&ControlPlaneGraph) -> R + Send + 'static,
+    ) -> R {
+        let graph = Arc::clone(&self.graph);
+        match tokio::task::spawn_blocking(move || f(&graph)).await {
+            Ok(r) => r,
+            Err(e) => std::panic::resume_unwind(e.into_panic()),
+        }
+    }
+
     /// The catalog, built from the datasets in the settings graph.
-    pub fn catalog(&self) -> Result<Catalog, GraphError> {
+    pub async fn catalog(&self) -> Result<Catalog, GraphError> {
         Ok(Catalog {
             context: control_plane_core::dsp_context(),
             id: self.settings.catalog_id.clone(),
             type_: "Catalog".to_string(),
             participant_id: self.settings.agent_id.clone(),
             service: vec![self.data_service()],
-            dataset: self.graph.datasets()?,
+            dataset: self.with_graph(|g| g.datasets()).await?,
         })
     }
 }

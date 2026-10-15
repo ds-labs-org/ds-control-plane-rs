@@ -111,15 +111,20 @@ fn store_error(provider_pid: Option<&str>, e: GraphError) -> axum::response::Res
 
 /// Applies `to` to the stored negotiation `provider_pid` and maps the
 /// outcome to the HTTP response every state-changing endpoint shares.
-fn transition(
+async fn transition(
     state: &AppState,
     provider_pid: &str,
     to: NegotiationState,
 ) -> axum::response::Response {
-    let result = state.graph.update_negotiation(provider_pid, |n| {
-        let from = n.state;
-        n.transition(to).map_err(|_| (from, n.consumer_pid.clone()))
-    });
+    let pid = provider_pid.to_string();
+    let result = state
+        .with_graph(move |g| {
+            g.update_negotiation(&pid, |n| {
+                let from = n.state;
+                n.transition(to).map_err(|_| (from, n.consumer_pid.clone()))
+            })
+        })
+        .await;
     match result {
         Ok(Some(Ok(()))) => StatusCode::OK.into_response(),
         Ok(Some(Err((from, consumer_pid)))) => {
@@ -152,7 +157,8 @@ pub async fn get_negotiation(
     State(state): State<Arc<AppState>>,
     Path(provider_pid): Path<String>,
 ) -> impl IntoResponse {
-    match state.graph.negotiation(&provider_pid) {
+    let lookup = provider_pid.clone();
+    match state.with_graph(move |g| g.negotiation(&lookup)).await {
         Ok(Some(n)) => (StatusCode::OK, Json(n.to_ack())).into_response(),
         Ok(None) => not_found(&provider_pid).into_response(),
         Err(e) => store_error(Some(&provider_pid), e),
@@ -174,7 +180,8 @@ pub async fn initiate_negotiation(
     let mut negotiation = ContractNegotiation::new(provider_pid, msg.consumer_pid.clone());
     negotiation.dataset_id = msg.offer.target.clone();
     negotiation.offer = Some(msg.offer);
-    match state.graph.put_negotiation(&negotiation) {
+    let stored = negotiation.clone();
+    match state.with_graph(move |g| g.put_negotiation(&stored)).await {
         Ok(()) => (StatusCode::CREATED, Json(negotiation.to_ack())).into_response(),
         Err(e) => store_error(None, e),
     }
@@ -193,10 +200,15 @@ pub async fn continue_negotiation(
     if let Some(reason) = oversized(&msg.offer) {
         return rejected_offer(Some(&provider_pid), &msg.consumer_pid, reason);
     }
-    let result = state.graph.update_negotiation(&provider_pid, |n| {
-        n.offer = Some(msg.offer);
-        Ok::<(), ()>(())
-    });
+    let pid = provider_pid.clone();
+    let result = state
+        .with_graph(move |g| {
+            g.update_negotiation(&pid, |n| {
+                n.offer = Some(msg.offer);
+                Ok::<(), ()>(())
+            })
+        })
+        .await;
     match result {
         Ok(Some(_)) => StatusCode::OK.into_response(),
         Ok(None) => not_found(&provider_pid).into_response(),
@@ -213,7 +225,8 @@ pub async fn negotiation_event(
     Json(msg): Json<ContractNegotiationEventMessage>,
 ) -> impl IntoResponse {
     if msg.event_type != NegotiationEventType::Accepted {
-        let consumer_pid = match state.graph.negotiation(&provider_pid) {
+        let lookup = provider_pid.clone();
+        let consumer_pid = match state.with_graph(move |g| g.negotiation(&lookup)).await {
             Ok(Some(n)) => n.consumer_pid,
             Ok(None) => return not_found(&provider_pid).into_response(),
             Err(e) => return store_error(Some(&provider_pid), e),
@@ -229,7 +242,7 @@ pub async fn negotiation_event(
         )
             .into_response();
     }
-    transition(&state, &provider_pid, NegotiationState::Accepted)
+    transition(&state, &provider_pid, NegotiationState::Accepted).await
 }
 
 /// `POST {dsp}/negotiations/:providerPid/agreement/verification`.
@@ -238,7 +251,7 @@ pub async fn verify_agreement(
     Path(provider_pid): Path<String>,
     Json(_msg): Json<ContractAgreementVerificationMessage>,
 ) -> impl IntoResponse {
-    transition(&state, &provider_pid, NegotiationState::Verified)
+    transition(&state, &provider_pid, NegotiationState::Verified).await
 }
 
 /// `POST {dsp}/negotiations/:providerPid/termination`.
@@ -247,5 +260,5 @@ pub async fn terminate_negotiation(
     Path(provider_pid): Path<String>,
     Json(_msg): Json<ContractNegotiationTerminationMessage>,
 ) -> impl IntoResponse {
-    transition(&state, &provider_pid, NegotiationState::Terminated)
+    transition(&state, &provider_pid, NegotiationState::Terminated).await
 }
