@@ -449,8 +449,6 @@ impl Reader<'_> {
     }
 }
 
-/// A `NamedNode` for one of this crate's own vocabulary IRIs, which are
-/// all built from the constants in [`crate::vocab`] and known valid.
 /// Decodes every node of a list read with `read`, skipping (and logging)
 /// the ones that fail to decode instead of failing the whole list: one
 /// damaged record must not hide every other one, nor stop the server from
@@ -474,6 +472,8 @@ pub(crate) fn readable<T>(
     Ok(out)
 }
 
+/// A `NamedNode` for one of this crate's own vocabulary IRIs, which are
+/// all built from the constants in [`crate::vocab`] and known valid.
 pub(crate) fn iri(value: String) -> NamedNode {
     NamedNode::new_unchecked(value)
 }
