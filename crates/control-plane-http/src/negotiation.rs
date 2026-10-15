@@ -95,13 +95,17 @@ fn not_found(provider_pid: &str) -> impl IntoResponse {
     )
 }
 
-fn store_error(provider_pid: Option<&str>, e: GraphError) -> axum::response::Response {
+fn store_error(
+    provider_pid: Option<&str>,
+    consumer_pid: Option<&str>,
+    e: GraphError,
+) -> axum::response::Response {
     tracing::error!(error = %e, "negotiation store error");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(ContractNegotiationError::new(
             provider_pid.map(str::to_string),
-            None,
+            consumer_pid.map(str::to_string),
             "500",
             "negotiation store error",
         )),
@@ -131,7 +135,7 @@ async fn transition(
             bad_transition(provider_pid, &consumer_pid, from, to).into_response()
         }
         Ok(None) => not_found(provider_pid).into_response(),
-        Err(e) => store_error(Some(provider_pid), e),
+        Err(e) => store_error(Some(provider_pid), None, e),
     }
 }
 
@@ -161,7 +165,7 @@ pub async fn get_negotiation(
     match state.with_graph(move |g| g.negotiation(&lookup)).await {
         Ok(Some(n)) => (StatusCode::OK, Json(n.to_ack())).into_response(),
         Ok(None) => not_found(&provider_pid).into_response(),
-        Err(e) => store_error(Some(&provider_pid), e),
+        Err(e) => store_error(Some(&provider_pid), None, e),
     }
 }
 
@@ -183,7 +187,11 @@ pub async fn initiate_negotiation(
     let stored = negotiation.clone();
     match state.with_graph(move |g| g.put_negotiation(&stored)).await {
         Ok(()) => (StatusCode::CREATED, Json(negotiation.to_ack())).into_response(),
-        Err(e) => store_error(None, e),
+        Err(e) => store_error(
+            Some(&negotiation.provider_pid),
+            Some(&negotiation.consumer_pid),
+            e,
+        ),
     }
 }
 
@@ -212,7 +220,7 @@ pub async fn continue_negotiation(
     match result {
         Ok(Some(_)) => StatusCode::OK.into_response(),
         Ok(None) => not_found(&provider_pid).into_response(),
-        Err(e) => store_error(Some(&provider_pid), e),
+        Err(e) => store_error(Some(&provider_pid), None, e),
     }
 }
 
@@ -229,7 +237,7 @@ pub async fn negotiation_event(
         let consumer_pid = match state.with_graph(move |g| g.negotiation(&lookup)).await {
             Ok(Some(n)) => n.consumer_pid,
             Ok(None) => return not_found(&provider_pid).into_response(),
-            Err(e) => return store_error(Some(&provider_pid), e),
+            Err(e) => return store_error(Some(&provider_pid), None, e),
         };
         return (
             StatusCode::BAD_REQUEST,

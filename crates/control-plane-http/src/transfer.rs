@@ -18,13 +18,17 @@ use control_plane_graph::GraphError;
 
 use crate::state::AppState;
 
-fn store_error(provider_pid: Option<&str>, e: GraphError) -> axum::response::Response {
+fn store_error(
+    provider_pid: Option<&str>,
+    consumer_pid: Option<&str>,
+    e: GraphError,
+) -> axum::response::Response {
     tracing::error!(error = %e, "transfer store error");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(TransferErrorMessage::new(
             provider_pid.map(str::to_string),
-            None,
+            consumer_pid.map(str::to_string),
             "500",
             "transfer process store error",
         )),
@@ -70,7 +74,7 @@ pub async fn get_transfer(
     match state.with_graph(move |g| g.transfer(&lookup)).await {
         Ok(Some(t)) => (StatusCode::OK, Json(t.to_ack())).into_response(),
         Ok(None) => not_found(&provider_pid).into_response(),
-        Err(e) => store_error(Some(&provider_pid), e),
+        Err(e) => store_error(Some(&provider_pid), None, e),
     }
 }
 
@@ -91,7 +95,11 @@ pub async fn initiate_transfer(
     let stored = transfer.clone();
     match state.with_graph(move |g| g.put_transfer(&stored)).await {
         Ok(()) => (StatusCode::CREATED, Json(transfer.to_ack())).into_response(),
-        Err(e) => store_error(None, e),
+        Err(e) => store_error(
+            Some(&transfer.provider_pid),
+            Some(&transfer.consumer_pid),
+            e,
+        ),
     }
 }
 
@@ -151,7 +159,7 @@ async fn transition(
             bad_transition(provider_pid, &consumer_pid, from, to).into_response()
         }
         Ok(None) => not_found(provider_pid).into_response(),
-        Err(e) => store_error(Some(provider_pid), e),
+        Err(e) => store_error(Some(provider_pid), None, e),
     }
 }
 
