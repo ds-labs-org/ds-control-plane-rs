@@ -205,7 +205,14 @@ the catalog, negotiations and transfer processes survive a restart
 restarts on the same directory and reads everything back). Unset, the
 store is in memory as before. RocksDB is oxigraph's `rocksdb` feature,
 a from-source C++ build, on by default through `control-plane-graph`'s
-own `rocksdb` feature. Only one process can hold a store directory open.
+own `rocksdb` feature. Only one process can hold a store directory open:
+while the server runs, a separate process cannot open `GRAPH_STORE_PATH`
+(and an in-memory store cannot be shared at all). Connector writes to a
+running server therefore go through the server's own handle, `App::graph`
+(`ControlPlaneConnector::new(app.graph.clone())` in-process, as
+`crates/control-plane-http/tests/connector.rs` does), and the catalog
+serves them at once; a separate driver process can only write while the
+server is stopped.
 
 **Damaged records:** writes reject id collisions, but a record can still
 come back unreadable (an older release, a hand edit). List reads

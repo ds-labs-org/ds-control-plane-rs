@@ -64,5 +64,8 @@ async fn a_dataset_pushed_through_the_connector_is_served_without_a_restart() {
         .iter()
         .map(|d| d["@id"].as_str().unwrap().to_string())
         .collect();
-    assert!(ids.contains(&"urn:uuid:pushed-dataset".to_string()), "{ids:?}");
+    assert!(
+        ids.contains(&"urn:uuid:pushed-dataset".to_string()),
+        "{ids:?}"
+    );
 }

@@ -20,6 +20,8 @@ use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 
+use control_plane_graph::ControlPlaneGraph;
+
 use crate::config::Config;
 use crate::state::AppState;
 
@@ -33,6 +35,12 @@ pub const MAX_BODY_BYTES: usize = 256 * 1024;
 pub struct App {
     pub listener: tokio::net::TcpListener,
     pub router: Router,
+    /// The store the router serves. A persistent store holds RocksDB's
+    /// exclusive lock, so no other process can open it while the server
+    /// runs: in-process code (a Contreforts `ControlPlaneConnector` in
+    /// particular) shares this handle instead, and its writes are served
+    /// at once.
+    pub graph: Arc<ControlPlaneGraph>,
 }
 
 /// Builds the whole application from `config` and binds its listener.
@@ -52,6 +60,7 @@ pub async fn build(config: Config) -> anyhow::Result<App> {
         "opened control plane graph"
     );
 
+    let graph = state.graph.clone();
     let router = Router::new()
         .route(
             "/.well-known/dspace-version",
@@ -119,7 +128,11 @@ pub async fn build(config: Config) -> anyhow::Result<App> {
     let addr = format!("0.0.0.0:{}", config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
-    Ok(App { listener, router })
+    Ok(App {
+        listener,
+        router,
+        graph,
+    })
 }
 
 /// Runs the router against its already-bound listener until either it
