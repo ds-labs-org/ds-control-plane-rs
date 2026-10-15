@@ -19,6 +19,17 @@ use crate::policy::{read_agreement, read_offer, write_agreement, write_offer};
 use crate::store::{ControlPlaneGraph, GraphError, Reader, Writer, iri, lookup_iri, readable};
 use crate::vocab::{RUNTIME_GRAPH, dcterms, dscp, dspace};
 
+/// The most contract negotiations the runtime graph keeps. Once a write
+/// brings the store past it, the least recently modified negotiations
+/// (by `dcterms:modified`) are evicted, in the same write. Anyone who can
+/// reach `negotiations/request` can add one, and with RocksDB they stay on
+/// disk, so this is the ceiling on what such a caller can make the store
+/// hold. `ds-identity-hub-rs` caps its equivalent structures the same way.
+pub const MAX_NEGOTIATIONS: usize = 2048;
+
+/// The same ceiling for transfer processes.
+pub const MAX_TRANSFERS: usize = 2048;
+
 /// A stored record together with when it was last written.
 #[derive(Debug, Clone)]
 pub struct Record<T> {

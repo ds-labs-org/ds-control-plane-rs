@@ -300,6 +300,63 @@ fn records_carry_a_modified_timestamp() {
     assert!(records[0].modified >= before - chrono::Duration::seconds(1));
 }
 
+#[test]
+fn negotiations_past_the_cap_evict_the_least_recently_modified() {
+    let graph = ControlPlaneGraph::open_in_memory().unwrap();
+    for i in 0..MAX_NEGOTIATIONS {
+        let mut n = negotiation();
+        n.provider_pid = format!("urn:uuid:n{i}");
+        graph.put_negotiation(&n).unwrap();
+    }
+    // Rewriting n0 makes n1 the least recently modified.
+    graph
+        .update_negotiation("urn:uuid:n0", |_| Ok::<(), ()>(()))
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let mut n = negotiation();
+    n.provider_pid = "urn:uuid:newest".to_string();
+    graph.put_negotiation(&n).unwrap();
+
+    assert_eq!(graph.negotiation_count().unwrap(), MAX_NEGOTIATIONS);
+    assert!(graph.negotiation("urn:uuid:n1").unwrap().is_none());
+    assert!(graph.negotiation("urn:uuid:n0").unwrap().is_some());
+    assert!(graph.negotiation("urn:uuid:n2").unwrap().is_some());
+    assert!(graph.negotiation("urn:uuid:newest").unwrap().is_some());
+    // The evicted records' offer and agreement blank nodes went with them.
+    let quads = graph.store.len().unwrap();
+    let per_record = {
+        let one = ControlPlaneGraph::open_in_memory().unwrap();
+        one.put_negotiation(&negotiation()).unwrap();
+        one.store.len().unwrap()
+    };
+    assert_eq!(quads, per_record * MAX_NEGOTIATIONS);
+}
+
+#[test]
+fn transfers_past_the_cap_evict_the_least_recently_modified() {
+    let graph = ControlPlaneGraph::open_in_memory().unwrap();
+    for i in 0..=MAX_TRANSFERS {
+        graph
+            .put_transfer(&TransferProcess::new(
+                format!("urn:uuid:t{i}"),
+                "urn:uuid:c1",
+                "urn:uuid:agreement",
+                "HttpData-PULL",
+            ))
+            .unwrap();
+    }
+    assert_eq!(graph.transfer_count().unwrap(), MAX_TRANSFERS);
+    assert!(graph.transfer("urn:uuid:t0").unwrap().is_none());
+    assert!(graph.transfer("urn:uuid:t1").unwrap().is_some());
+    assert!(
+        graph
+            .transfer(&format!("urn:uuid:t{MAX_TRANSFERS}"))
+            .unwrap()
+            .is_some()
+    );
+}
+
 #[cfg(feature = "rocksdb")]
 #[test]
 fn everything_survives_reopening_an_on_disk_store() {

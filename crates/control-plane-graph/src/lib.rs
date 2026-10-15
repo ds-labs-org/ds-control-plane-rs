@@ -13,7 +13,7 @@ mod settings;
 mod store;
 pub mod vocab;
 
-pub use runtime::Record;
+pub use runtime::{MAX_NEGOTIATIONS, MAX_TRANSFERS, Record};
 pub use settings::ConnectorSettings;
 pub use store::{ControlPlaneGraph, GraphError};
 
