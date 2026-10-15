@@ -154,3 +154,27 @@ async fn transition(
         Err(e) => store_error(Some(provider_pid), e),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A store failure while handling a request whose consumerPid and
+    /// providerPid are known reports both, so the consumer can match the
+    /// error to its process.
+    #[tokio::test]
+    async fn store_errors_carry_the_known_pids() {
+        let e = GraphError::Missing {
+            node: "urn:uuid:p1".to_string(),
+            property: "state".to_string(),
+        };
+        let response = store_error(Some("urn:uuid:p1"), Some("urn:uuid:c1"), e);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["providerPid"], "urn:uuid:p1");
+        assert_eq!(body["consumerPid"], "urn:uuid:c1");
+    }
+}
