@@ -335,6 +335,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_of_a_missing_dataset_is_not_found_and_creates_nothing() {
+        let graph = graph();
+        let connector = ControlPlaneConnector::new(graph.clone());
+        match connector.update(&dataset_doc("urn:uuid:never")).await {
+            Err(ConnectorError::NotFound { kind, id }) => {
+                assert_eq!(kind, DATASET_KIND);
+                assert_eq!(id, "urn:uuid:never");
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+        assert!(graph.dataset("urn:uuid:never").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn push_of_an_existing_dataset_errors_and_leaves_it_unchanged() {
+        let graph = graph();
+        let connector = ControlPlaneConnector::new(graph.clone());
+        connector.push(&dataset_doc("urn:uuid:ds")).await.unwrap();
+        let before = serde_json::to_value(graph.datasets().unwrap()).unwrap();
+
+        let mut doc = dataset_doc("urn:uuid:ds");
+        doc.fields["distribution"][0]["format"] = serde_json::json!("OTHER");
+        let result = connector.push(&doc).await;
+        assert!(
+            matches!(result, Err(ConnectorError::Config(_))),
+            "{result:?}"
+        );
+        assert_eq!(
+            serde_json::to_value(graph.datasets().unwrap()).unwrap(),
+            before
+        );
+
+        // update is how an existing dataset is replaced.
+        let updated = connector.update(&doc).await.unwrap();
+        assert_eq!(updated.fields["distribution"][0]["format"], "OTHER");
+    }
+
+    #[tokio::test]
     async fn update_rejects_a_mismatched_id() {
         let connector = ControlPlaneConnector::new(graph());
         let mut doc = dataset_doc("urn:uuid:ds");
