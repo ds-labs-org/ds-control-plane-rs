@@ -167,6 +167,7 @@ async fn dsp_tck_matches_documented_bootstrap_scope() {
         agent_id: "urn:connector:ds-control-plane-rs".to_string(),
         base_url: format!("http://host.docker.internal:{SERVER_PORT}"),
         dsp_path: "/dsp/2025-1".to_string(),
+        store_path: None,
     };
 
     let app = control_plane_http::build(config)

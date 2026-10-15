@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 control-plane-core = { path = "../control-plane-core" }
+control-plane-graph = { path = "../control-plane-graph" }
 axum = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -24,6 +25,15 @@ chrono = { workspace = true }
 anyhow = { workspace = true }
 
 [dev-dependencies]
+tempfile = "3"
+# tests/connector.rs drives the Contreforts connector over the running
+# app's own graph.
+contreforts-core = { path = "../../vendor/contreforts-core" }
+control-plane-contreforts = { path = "../control-plane-contreforts" }
+# tests/persistence.rs damages a stored record directly, below the graph
+# crate's write checks, to check that startup and listings survive it.
+oxigraph = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
 # Runs the real `eclipsedataspacetck/dsp-tck-runtime` container in
 # tests/dsp_tck.rs, same crate this project's sibling ds-sql-dps-rs uses for
 # the analogous DPS TCK test.

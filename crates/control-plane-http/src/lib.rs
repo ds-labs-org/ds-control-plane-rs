@@ -17,16 +17,30 @@ pub mod transfer;
 use std::sync::Arc;
 
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
+
+use control_plane_graph::ControlPlaneGraph;
 
 use crate::config::Config;
 use crate::state::AppState;
+
+/// The largest request body any route accepts. Every DSP message is a
+/// small JSON-LD document; axum's own 2 MB default let one request carry
+/// an offer large enough to hold the store's write lock for seconds.
+pub const MAX_BODY_BYTES: usize = 256 * 1024;
 
 /// The fully assembled application: the listener already bound and the
 /// axum router fully built, ready to hand to [`serve`].
 pub struct App {
     pub listener: tokio::net::TcpListener,
     pub router: Router,
+    /// The store the router serves. A persistent store holds RocksDB's
+    /// exclusive lock, so no other process can open it while the server
+    /// runs: in-process code (a Contreforts `ControlPlaneConnector` in
+    /// particular) shares this handle instead, and its writes are served
+    /// at once.
+    pub graph: Arc<ControlPlaneGraph>,
 }
 
 /// Builds the whole application from `config` and binds its listener.
@@ -35,8 +49,18 @@ pub struct App {
 /// `TcpListener::local_addr()` when `config.port == 0`.
 pub async fn build(config: Config) -> anyhow::Result<App> {
     let dsp = &config.dsp_path;
-    let state = Arc::new(AppState::new(config.clone()));
+    let state = Arc::new(AppState::open(config.clone())?);
+    // Counts by type only: decoding every record here would make startup
+    // O(all records) and let one damaged record stop the server.
+    tracing::info!(
+        store = ?config.store_path,
+        datasets = state.graph.dataset_count()?,
+        negotiations = state.graph.negotiation_count()?,
+        transfers = state.graph.transfer_count()?,
+        "opened control plane graph"
+    );
 
+    let graph = state.graph.clone();
     let router = Router::new()
         .route(
             "/.well-known/dspace-version",
@@ -98,12 +122,17 @@ pub async fn build(config: Config) -> anyhow::Result<App> {
             &format!("{dsp}/transfers/{{provider_pid}}/suspension"),
             post(transfer::suspend_transfer),
         )
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
-    Ok(App { listener, router })
+    Ok(App {
+        listener,
+        router,
+        graph,
+    })
 }
 
 /// Runs the router against its already-bound listener until either it

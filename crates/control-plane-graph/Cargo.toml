@@ -1,0 +1,33 @@
+[package]
+name = "control-plane-graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Oxigraph RDF store for ds-control-plane-rs: the connector's settings (identity, catalog datasets and their ODRL offers) and its runtime state (contract negotiations, transfer processes) as real, SPARQL-addressable triples."
+
+[features]
+default = ["rocksdb"]
+# On-disk persistence (`ControlPlaneGraph::open`). Pulls in oxigraph's
+# RocksDB backend, a from-source C++ build; turn default features off to
+# build an in-memory-only store without it.
+rocksdb = ["oxigraph/rocksdb"]
+
+[dependencies]
+control-plane-core = { path = "../control-plane-core" }
+oxigraph = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+# Not used directly. Keeps a digest-0.11-compatible `sha2` in the build for
+# oxigraph's SPARQL `HASH()` support (`spareval`), so that a crate pulling
+# in the older `sha2` 0.10 (e.g. via `p256`) cannot unify it away and break
+# oxigraph's build: the exact failure ds-identity-hub-rs hit (see its
+# ARCHITECTURE.md, "Provenance: Contreforts").
+sha2 = "0.11"
+
+[dev-dependencies]
+tempfile = "3"

@@ -31,7 +31,8 @@ a real, date-stamped Eclipse Dataspace TCK conformance snapshot.
 - **Metadata**: the `/.well-known/dspace-version` endpoint — implemented in
   full.
 - **Catalog**: `POST {dsp}/catalog/request`, `GET {dsp}/catalog/datasets/:id`
-  — real DSP message shapes, a single in-memory seed dataset, no filtering.
+  — real DSP message shapes, datasets served from an RDF settings graph
+  (seeded with one dataset), no filtering.
 - **Contract negotiation**: the full Provider-role HTTP surface
   (`negotiations/request`, `.../request`, `.../events`,
   `.../agreement/verification`, `.../termination`) and a
@@ -54,15 +55,29 @@ crates/
   control-plane-core/   Domain types: DCAT/ODRL-flavored catalog vocabulary,
                         the ContractNegotiation and TransferProcess state
                         machines, and their DSP wire message shapes.
+  control-plane-graph/  Oxigraph RDF store: the settings graph (connector
+                        identity, catalog datasets and ODRL offers) and the
+                        runtime graph (negotiations, transfer processes),
+                        in memory or persisted with RocksDB.
+  control-plane-contreforts/
+                        Contreforts connector over that store, with its
+                        SHACL-validated declaration.ttl.
   control-plane-http/   axum HTTP server exposing the real DSP endpoint
-                        paths, an in-memory store, and the
+                        paths on top of the store, and the
                         `ds-control-plane-rs` binary.
     tests/dsp_tck.rs    Runs the real, official Eclipse Dataspace TCK
                         (`eclipsedataspacetck/dsp-tck-runtime`) against an
                         in-process instance of this server.
+vendor/
+  contreforts-core/     Git submodule (pinned), as in ds-identity-hub-rs.
 ```
 
 ## Building and testing
+
+`vendor/contreforts-core` is a git submodule: clone with
+`--recurse-submodules`, or run `git submodule update --init` first. The
+default build compiles RocksDB from source (needs a C++ toolchain and
+`clang`).
 
 ```bash
 cargo build --workspace
@@ -79,7 +94,9 @@ cargo run -p control-plane-http
 
 Configuration is via environment variables (`crates/control-plane-http/src/config.rs`):
 `PORT` (default `8080`), `AGENT_ID`, `BASE_URL`, `DSP_PATH` (default
-`/dsp/2025-1`).
+`/dsp/2025-1`), and `GRAPH_STORE_PATH`: a directory for the on-disk RDF
+store, so the catalog and every negotiation and transfer process survive a
+restart. Unset, everything is kept in memory.
 
 ### Dataspace Protocol TCK conformance
 

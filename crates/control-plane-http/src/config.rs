@@ -1,6 +1,8 @@
 //! Process configuration, read from environment variables with sane
 //! defaults so the binary runs unconfigured out of the box.
 
+use std::path::PathBuf;
+
 /// Runtime configuration for the control plane HTTP server.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -22,6 +24,11 @@ pub struct Config {
     /// endpoint (catalog/negotiations/transfers), e.g. `/dsp/2025-1` — no
     /// trailing slash.
     pub dsp_path: String,
+    /// Directory of the on-disk RDF store holding this connector's settings
+    /// graph and runtime state (`control-plane-graph`). `None` keeps
+    /// everything in memory, lost on exit. Read from `GRAPH_STORE_PATH`,
+    /// the same variable Contreforts' own `GraphConfig` uses.
+    pub store_path: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -31,13 +38,15 @@ impl Default for Config {
             agent_id: "urn:connector:ds-control-plane-rs".to_string(),
             base_url: "http://localhost:8080".to_string(),
             dsp_path: "/dsp/2025-1".to_string(),
+            store_path: None,
         }
     }
 }
 
 impl Config {
-    /// Reads `PORT`, `AGENT_ID`, `BASE_URL`, `DSP_PATH` from the
-    /// environment, falling back to [`Config::default`] for anything unset.
+    /// Reads `PORT`, `AGENT_ID`, `BASE_URL`, `DSP_PATH`, `GRAPH_STORE_PATH`
+    /// from the environment, falling back to [`Config::default`] for
+    /// anything unset (an empty `GRAPH_STORE_PATH` counts as unset).
     pub fn from_env() -> Self {
         let default = Self::default();
         Self {
@@ -48,6 +57,9 @@ impl Config {
             agent_id: std::env::var("AGENT_ID").unwrap_or(default.agent_id),
             base_url: std::env::var("BASE_URL").unwrap_or(default.base_url),
             dsp_path: std::env::var("DSP_PATH").unwrap_or(default.dsp_path),
+            store_path: std::env::var_os("GRAPH_STORE_PATH")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from),
         }
     }
 

@@ -1,6 +1,17 @@
 [workspace]
 resolver = "2"
-members = ["crates/control-plane-core", "crates/control-plane-http"]
+members = [
+    "crates/control-plane-core",
+    "crates/control-plane-graph",
+    "crates/control-plane-contreforts",
+    "crates/control-plane-http",
+    "vendor/contreforts-core",
+]
+
+# vendor/contreforts-core (a git submodule) inherits `version`/`edition`
+# via `.workspace = true`: upstream ships it to be vendored as a member of
+# a consuming workspace, never built standalone. Same arrangement, and the
+# same pinned commit, as ds-identity-hub-rs and ds-sql-dps-rs.
 
 [workspace.package]
 version = "0.1.0"
@@ -18,3 +29,15 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
 axum = "0.8"
+
+# Contreforts-backed semantic storage (crates/control-plane-graph,
+# crates/control-plane-contreforts). Versions match ds-identity-hub-rs and
+# ds-sql-dps-rs. `default-features = false` drops oxigraph's RocksDB
+# backend here; control-plane-graph opts back in behind its own `rocksdb`
+# feature, which is what makes the on-disk store possible.
+oxigraph = { version = "0.5", default-features = false }
+async-trait = "0.1"
+# Required only because vendor/contreforts-core inherits these via
+# `.workspace = true`; not used directly by this project's own crates.
+dirs = "5"
+urlencoding = "2"

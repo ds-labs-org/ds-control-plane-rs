@@ -14,7 +14,27 @@ use control_plane_core::transfer::{
     TransferStartMessage, TransferState, TransferSuspensionMessage, TransferTerminationMessage,
 };
 
+use control_plane_graph::GraphError;
+
 use crate::state::AppState;
+
+fn store_error(
+    provider_pid: Option<&str>,
+    consumer_pid: Option<&str>,
+    e: GraphError,
+) -> axum::response::Response {
+    tracing::error!(error = %e, "transfer store error");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(TransferErrorMessage::new(
+            provider_pid.map(str::to_string),
+            consumer_pid.map(str::to_string),
+            "500",
+            "transfer process store error",
+        )),
+    )
+        .into_response()
+}
 
 fn not_found(provider_pid: &str) -> impl IntoResponse {
     (
@@ -50,10 +70,11 @@ pub async fn get_transfer(
     State(state): State<Arc<AppState>>,
     Path(provider_pid): Path<String>,
 ) -> impl IntoResponse {
-    let transfers = state.transfers.lock().expect("transfers lock poisoned");
-    match transfers.get(&provider_pid) {
-        Some(t) => (StatusCode::OK, Json(t.to_ack())).into_response(),
-        None => not_found(&provider_pid).into_response(),
+    let lookup = provider_pid.clone();
+    match state.with_graph(move |g| g.transfer(&lookup)).await {
+        Ok(Some(t)) => (StatusCode::OK, Json(t.to_ack())).into_response(),
+        Ok(None) => not_found(&provider_pid).into_response(),
+        Err(e) => store_error(Some(&provider_pid), None, e),
     }
 }
 
@@ -66,18 +87,20 @@ pub async fn initiate_transfer(
 ) -> impl IntoResponse {
     let provider_pid = format!("urn:uuid:{}", uuid::Uuid::new_v4());
     let transfer = TransferProcess::new(
-        provider_pid.clone(),
+        provider_pid,
         msg.consumer_pid.clone(),
         msg.agreement_id,
         msg.format,
     );
-    let ack = transfer.to_ack();
-    state
-        .transfers
-        .lock()
-        .expect("transfers lock poisoned")
-        .insert(provider_pid, transfer);
-    (StatusCode::CREATED, Json(ack))
+    let stored = transfer.clone();
+    match state.with_graph(move |g| g.put_transfer(&stored)).await {
+        Ok(()) => (StatusCode::CREATED, Json(transfer.to_ack())).into_response(),
+        Err(e) => store_error(
+            Some(&transfer.provider_pid),
+            Some(&transfer.consumer_pid),
+            e,
+        ),
+    }
 }
 
 /// `POST {dsp}/transfers/:providerPid/start`.
@@ -121,13 +144,45 @@ async fn transition(
     provider_pid: &str,
     to: TransferState,
 ) -> axum::response::Response {
-    let mut transfers = state.transfers.lock().expect("transfers lock poisoned");
-    let Some(t) = transfers.get_mut(provider_pid) else {
-        return not_found(provider_pid).into_response();
-    };
-    let from = t.state;
-    match t.transition(to) {
-        Ok(()) => StatusCode::OK.into_response(),
-        Err(_) => bad_transition(provider_pid, &t.consumer_pid, from, to).into_response(),
+    let pid = provider_pid.to_string();
+    let result = state
+        .with_graph(move |g| {
+            g.update_transfer(&pid, |t| {
+                let from = t.state;
+                t.transition(to).map_err(|_| (from, t.consumer_pid.clone()))
+            })
+        })
+        .await;
+    match result {
+        Ok(Some(Ok(()))) => StatusCode::OK.into_response(),
+        Ok(Some(Err((from, consumer_pid)))) => {
+            bad_transition(provider_pid, &consumer_pid, from, to).into_response()
+        }
+        Ok(None) => not_found(provider_pid).into_response(),
+        Err(e) => store_error(Some(provider_pid), None, e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A store failure while handling a request whose consumerPid and
+    /// providerPid are known reports both, so the consumer can match the
+    /// error to its process.
+    #[tokio::test]
+    async fn store_errors_carry_the_known_pids() {
+        let e = GraphError::Missing {
+            node: "urn:uuid:p1".to_string(),
+            property: "state".to_string(),
+        };
+        let response = store_error(Some("urn:uuid:p1"), Some("urn:uuid:c1"), e);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["providerPid"], "urn:uuid:p1");
+        assert_eq!(body["consumerPid"], "urn:uuid:c1");
     }
 }
