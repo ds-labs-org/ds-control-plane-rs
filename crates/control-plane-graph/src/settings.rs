@@ -235,6 +235,42 @@ impl ControlPlaneGraph {
     /// [`Self::put_settings`] alone.
     pub fn put_dataset(&self, dataset: &Dataset) -> Result<(), GraphError> {
         let _guard = self.write_guard();
+        self.write_dataset(dataset)
+    }
+
+    /// [`Self::put_dataset`], but only when no dataset with that id exists
+    /// yet. Returns whether it was written; `false` writes nothing. The
+    /// check and the write share one write lock.
+    pub fn put_dataset_if_absent(&self, dataset: &Dataset) -> Result<bool, GraphError> {
+        let _guard = self.write_guard();
+        if self.has_dataset(&dataset.id)? {
+            return Ok(false);
+        }
+        self.write_dataset(dataset).map(|()| true)
+    }
+
+    /// [`Self::put_dataset`], but only when a dataset with that id already
+    /// exists. Returns whether it was written; `false` writes nothing. The
+    /// check and the write share one write lock.
+    pub fn replace_dataset_if_present(&self, dataset: &Dataset) -> Result<bool, GraphError> {
+        let _guard = self.write_guard();
+        if !self.has_dataset(&dataset.id)? {
+            return Ok(false);
+        }
+        self.write_dataset(dataset).map(|()| true)
+    }
+
+    /// Whether the dataset `id` exists. The caller holds a lock.
+    fn has_dataset(&self, id: &str) -> Result<bool, GraphError> {
+        let Some(node) = lookup_iri(id) else {
+            return Ok(false);
+        };
+        self.reader(&settings_graph())
+            .has_type(node.as_ref().into(), &dcat("Dataset"))
+    }
+
+    /// The body of [`Self::put_dataset`]; the caller holds the write lock.
+    fn write_dataset(&self, dataset: &Dataset) -> Result<(), GraphError> {
         let graph = settings_graph();
         let node = NamedNode::new(&dataset.id)?;
         let r = self.reader(&graph);

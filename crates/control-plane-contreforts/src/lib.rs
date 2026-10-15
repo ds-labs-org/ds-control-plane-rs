@@ -10,9 +10,9 @@
 //! namespace are this project's own (`declaration.ttl`), not Contreforts'
 //! business vocabulary.
 //!
-//! Datasets are the one writable kind: `push`/`update` add or replace a
-//! dataset in the catalog, which is how a Contreforts driver manages this
-//! connector's settings. Negotiations and transfers are read-only here;
+//! Datasets are the one writable kind: `push` adds a new dataset and
+//! `update` replaces an existing one, which is how a Contreforts driver
+//! manages this connector's settings. Negotiations and transfers are read-only here;
 //! they only change through the DSP protocol itself.
 
 use std::sync::Arc;
@@ -137,16 +137,14 @@ impl ControlPlaneConnector {
         }
     }
 
-    fn write_dataset(&self, doc: &Document) -> Result<Document, ConnectorError> {
+    fn dataset_of(&self, doc: &Document) -> Result<Dataset, ConnectorError> {
         if doc.kind.as_str() != DATASET_KIND {
             return Err(ConnectorError::Unsupported {
                 connector: self.source_name().to_string(),
                 operation: format!("write (kind: {})", doc.kind),
             });
         }
-        let dataset: Dataset = serde_json::from_value(doc.fields.clone())?;
-        self.graph.put_dataset(&dataset).map_err(to_api_err)?;
-        dataset_document(dataset)
+        Ok(serde_json::from_value(doc.fields.clone())?)
     }
 }
 
@@ -214,13 +212,27 @@ impl ContrefortsConnector for ControlPlaneConnector {
     }
 
     /// Adds a dataset to the catalog; `doc.fields` is the dataset's DSP
-    /// JSON (`@id`, `hasPolicy`, `distribution`).
+    /// JSON (`@id`, `hasPolicy`, `distribution`). A dataset with that id
+    /// already existing is a `Config` error and changes nothing: replacing
+    /// one is `update`'s job.
     async fn push(&self, doc: &Document) -> Result<Document, ConnectorError> {
-        self.write_dataset(doc)
+        let dataset = self.dataset_of(doc)?;
+        if !self
+            .graph
+            .put_dataset_if_absent(&dataset)
+            .map_err(to_api_err)?
+        {
+            return Err(ConnectorError::Config(format!(
+                "dataset '{}' already exists; use update to replace it",
+                dataset.id
+            )));
+        }
+        dataset_document(dataset)
     }
 
     /// Replaces the dataset `doc.remote_id` with `doc.fields`, whose `@id`
-    /// must match it.
+    /// must match it. An unknown `remote_id` is `NotFound` and creates
+    /// nothing.
     async fn update(&self, doc: &Document) -> Result<Document, ConnectorError> {
         if doc.kind.as_str() == DATASET_KIND
             && doc.fields.get("@id").and_then(|v| v.as_str()) != Some(doc.remote_id.as_str())
@@ -230,7 +242,15 @@ impl ContrefortsConnector for ControlPlaneConnector {
                 doc.remote_id
             )));
         }
-        self.write_dataset(doc)
+        let dataset = self.dataset_of(doc)?;
+        if !self
+            .graph
+            .replace_dataset_if_present(&dataset)
+            .map_err(to_api_err)?
+        {
+            return Err(not_found(&doc.kind, &doc.remote_id));
+        }
+        dataset_document(dataset)
     }
 }
 

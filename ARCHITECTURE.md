@@ -228,7 +228,7 @@ driver can resolve each back to its class:
 
 | Kind | Graph | `pull`/`get` | `push`/`update` |
 |---|---|---|---|
-| `ds-control-plane-rs:dataset` | settings | yes | add/replace a catalog dataset |
+| `ds-control-plane-rs:dataset` | settings | yes | `push` adds a new catalog dataset (an existing id is a `Config` error); `update` replaces an existing one (an unknown id is `NotFound`) |
 | `ds-control-plane-rs:contract-negotiation` | runtime | yes, `since` filters on `dcterms:modified` | unsupported |
 | `ds-control-plane-rs:transfer-process` | runtime | yes, `since` filters on `dcterms:modified` | unsupported |
 
