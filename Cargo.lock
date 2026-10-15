@@ -439,6 +439,8 @@ dependencies = [
  "anyhow",
  "axum",
  "chrono",
+ "contreforts-core",
+ "control-plane-contreforts",
  "control-plane-core",
  "control-plane-graph",
  "futures",
