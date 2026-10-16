@@ -380,12 +380,23 @@ pub async fn finalize(state: Arc<AppState>, provider_pid: String) {
     }
 }
 
-/// `POST {dsp}/negotiations/:providerPid/termination`.
+/// `POST {dsp}/negotiations/:providerPid/termination`. Terminating an
+/// already `TERMINATED` negotiation succeeds without a change: the
+/// Provider terminates on its own when it cannot deliver an agreement
+/// ([`agree`]), and the Consumer may not have heard of that yet.
 pub async fn terminate_negotiation(
     State(state): State<Arc<AppState>>,
     Path(provider_pid): Path<String>,
     Json(_msg): Json<ContractNegotiationTerminationMessage>,
 ) -> impl IntoResponse {
+    let lookup = provider_pid.clone();
+    match state.with_graph(move |g| g.negotiation(&lookup)).await {
+        Ok(Some(n)) if n.state == NegotiationState::Terminated => {
+            return StatusCode::OK.into_response();
+        }
+        Ok(_) => {}
+        Err(e) => return store_error(Some(&provider_pid), None, e),
+    }
     transition(&state, &provider_pid, NegotiationState::Terminated).await
 }
 

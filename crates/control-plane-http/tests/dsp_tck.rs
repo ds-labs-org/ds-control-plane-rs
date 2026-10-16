@@ -6,8 +6,9 @@
 //! ## Scope: what this actually proves, and what it doesn't
 //!
 //! This control plane is a bootstrap, Provider role only, with an
-//! always-allow stub policy and no automatic negotiation/transfer
-//! progression logic (see `../../../ARCHITECTURE.md`, "Scope"). The DSP
+//! always-allow stub policy: its provider agrees to every request and
+//! finalizes once verified, but never counter-offers and never starts a
+//! transfer on its own (see `../../../ARCHITECTURE.md`, "Scope"). The DSP
 //! TCK's own config-driven filtering
 //! (`dsp.tck.properties`'s `dataspacetck.test.package`) selects whole
 //! verification packages, not individual test classes — `CN`/`CN_C` share
@@ -75,29 +76,26 @@ const SERVER_PORT: u16 = 28080;
 /// (rather than "no failures") buys, and `dsp.tck.properties` for why the
 /// TCK's own filters can't exclude the Consumer-role tests outright.
 const EXPECTED_FAILURES: &[&str] = &[
-    // Contract negotiation, provider role (`CN`) and consumer role
-    // (`CN_C`): every one of these requires this control plane to
-    // *spontaneously* push a negotiation-advancing message (an Offer, an
-    // Agreement, a finalized/accepted event, or a termination) on its own
-    // initiative — this bootstrap's provider never acts, it only reacts to
-    // inbound requests against the Provider HTTP surface (see
-    // ../../../ARCHITECTURE.md, "Stubbed" — negotiation progression).
-    // `CN_C` additionally requires a whole consumer-role HTTP surface this
-    // bootstrap does not implement at all.
+    // Contract negotiation, provider role (`CN`): this provider agrees to
+    // every request and finalizes once the consumer verifies (see
+    // ../../../ARCHITECTURE.md, "Negotiation progression"), so the
+    // scenarios built on that path pass (`CN:01-04`, `CN:02-02`,
+    // `CN:02-03`, `CN:03-01`). These remaining ones need the provider to
+    // send a counter-offer first or to terminate on its own, which a
+    // provider that always agrees never does.
     "CN:01-01",
     "CN:01-02",
     "CN:01-03",
-    "CN:01-04",
     "CN:02-01",
-    "CN:02-03",
     "CN:02-04",
     "CN:02-05",
     "CN:02-06",
     "CN:02-07",
-    "CN:03-01",
     "CN:03-02",
     "CN:03-03",
     "CN:03-04",
+    // Contract negotiation, consumer role (`CN_C`): needs a whole
+    // consumer-role HTTP surface this bootstrap does not implement.
     "CN_C:01-01",
     "CN_C:01-02",
     "CN_C:01-03",
