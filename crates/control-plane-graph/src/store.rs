@@ -157,13 +157,15 @@ impl ControlPlaneGraph {
     /// Once `graph` holds more than `max` instances of `class`, removes the
     /// least recently modified ones (by `dcterms:modified`, then IRI) and
     /// everything reachable from them, back down to `max`, in one
-    /// transaction. A record whose timestamp is unreadable counts as the
-    /// oldest. Callers hold the write guard.
+    /// transaction. Records for which `keep_longer` is true go only once
+    /// every other record is gone. A record whose timestamp is unreadable
+    /// counts as the oldest. Callers hold the write guard.
     pub(crate) fn evict_oldest(
         &self,
         graph: &NamedNode,
         class: &str,
         max: usize,
+        keep_longer: impl Fn(&Reader<'_>, NamedOrBlankNodeRef<'_>) -> bool,
     ) -> Result<(), GraphError> {
         let r = self.reader(graph);
         let nodes = r.instances(class)?;
@@ -178,12 +180,16 @@ impl ControlPlaneGraph {
                 Err(e @ GraphError::Storage(_)) => return Err(e),
                 Err(_) => chrono::DateTime::<chrono::Utc>::MIN_UTC,
             };
-            aged.push((at, node));
+            aged.push((keep_longer(&r, node.as_ref()), at, node));
         }
-        aged.sort_by(|(a, x), (b, y)| a.cmp(b).then_with(|| x.to_string().cmp(&y.to_string())));
+        aged.sort_by(|(k, a, x), (l, b, y)| {
+            k.cmp(l)
+                .then_with(|| a.cmp(b))
+                .then_with(|| x.to_string().cmp(&y.to_string()))
+        });
         let excess = aged.len() - max;
         let mut old = Vec::new();
-        for (_, node) in aged.into_iter().take(excess) {
+        for (_, _, node) in aged.into_iter().take(excess) {
             old.extend(self.tree(graph, node.as_ref())?);
         }
         let mut transaction = self.store.start_transaction()?;
@@ -422,6 +428,45 @@ impl Reader<'_> {
                 property: predicate.to_string(),
                 value,
             })
+    }
+
+    /// The subjects carrying `predicate` with the plain string `value`.
+    pub(crate) fn subjects_with_str(
+        &self,
+        predicate: &str,
+        value: &str,
+    ) -> Result<Vec<NamedOrBlankNode>, GraphError> {
+        let predicate = iri(predicate.to_string());
+        let value = Literal::new_simple_literal(value);
+        let mut out = Vec::new();
+        for quad in self.store.quads_for_pattern(
+            None,
+            Some(predicate.as_ref()),
+            Some(value.as_ref().into()),
+            Some(self.graph),
+        ) {
+            out.push(quad?.subject);
+        }
+        Ok(out)
+    }
+
+    /// The subjects linking to `object` with `predicate`.
+    pub(crate) fn subjects_linking_to(
+        &self,
+        predicate: &str,
+        object: NamedOrBlankNodeRef<'_>,
+    ) -> Result<Vec<NamedOrBlankNode>, GraphError> {
+        let predicate = iri(predicate.to_string());
+        let mut out = Vec::new();
+        for quad in self.store.quads_for_pattern(
+            None,
+            Some(predicate.as_ref()),
+            Some(object.into()),
+            Some(self.graph),
+        ) {
+            out.push(quad?.subject);
+        }
+        Ok(out)
     }
 
     /// The node-valued objects of `predicate` on `subject`, sorted by their

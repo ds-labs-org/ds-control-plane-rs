@@ -83,6 +83,8 @@ pub enum NegotiationError {
     },
     #[error("no contract negotiation with providerPid '{0}'")]
     NotFound(String),
+    #[error("the contract negotiation has no offer with a target to agree to")]
+    NoOffer,
 }
 
 /// Server-side record of one Contract Negotiation. This is this crate's own
@@ -96,6 +98,11 @@ pub struct ContractNegotiation {
     pub dataset_id: Option<String>,
     pub offer: Option<Offer>,
     pub agreement: Option<Agreement>,
+    /// Where the Consumer receives the Provider's messages for this
+    /// negotiation (the `callbackAddress` of its initial
+    /// `ContractRequestMessage`). `None` means this Provider has no way to
+    /// reach the Consumer, so it never moves the negotiation on by itself.
+    pub callback_address: Option<String>,
 }
 
 impl ContractNegotiation {
@@ -107,7 +114,47 @@ impl ContractNegotiation {
             dataset_id: None,
             offer: None,
             agreement: None,
+            callback_address: None,
         }
+    }
+
+    /// Agrees to the current offer as `assigner`, granting it to
+    /// `assignee`: builds the `Agreement` (id `agreement_id`, the offer's
+    /// rules, its `target` or else this negotiation's dataset, stamped
+    /// `now`), stores it on this negotiation and moves to `AGREED`. Leaves
+    /// the negotiation unchanged on error.
+    pub fn agree(
+        &mut self,
+        agreement_id: impl Into<String>,
+        assigner: impl Into<String>,
+        assignee: impl Into<String>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<&Agreement, NegotiationError> {
+        if !is_valid_transition(self.state, NegotiationState::Agreed) {
+            return Err(NegotiationError::InvalidTransition {
+                from: self.state,
+                to: NegotiationState::Agreed,
+            });
+        }
+        let offer = self.offer.as_ref().ok_or(NegotiationError::NoOffer)?;
+        let target = offer
+            .target
+            .clone()
+            .or_else(|| self.dataset_id.clone())
+            .ok_or(NegotiationError::NoOffer)?;
+        self.agreement = Some(Agreement {
+            id: agreement_id.into(),
+            type_: "Agreement".to_string(),
+            target,
+            timestamp: now,
+            assigner: assigner.into(),
+            assignee: assignee.into(),
+            permission: offer.permission.clone(),
+            prohibition: offer.prohibition.clone(),
+            obligation: offer.obligation.clone(),
+        });
+        self.state = NegotiationState::Agreed;
+        Ok(self.agreement.as_ref().expect("just set"))
     }
 
     /// Attempts to move this negotiation to `to`, validating the

@@ -9,6 +9,7 @@ use control_plane_core::catalog::{Catalog, DataService, Dataset, Distribution};
 use control_plane_core::common::{Offer, Rule};
 use control_plane_graph::{ConnectorSettings, ControlPlaneGraph, GraphError};
 
+use crate::callback::Callbacks;
 use crate::config::Config;
 
 /// The dataset id the catalog is seeded with when the settings graph holds
@@ -27,6 +28,8 @@ pub struct AppState {
     /// settings graph.
     pub settings: ConnectorSettings,
     pub graph: Arc<ControlPlaneGraph>,
+    /// Sends this Provider's messages to Consumers' callback addresses.
+    pub callbacks: Callbacks,
 }
 
 impl AppState {
@@ -58,6 +61,7 @@ impl AppState {
             config,
             settings,
             graph: Arc::new(graph),
+            callbacks: Callbacks::new(),
         })
     }
 

@@ -172,7 +172,8 @@ pub async fn get_negotiation(
 /// `POST {dsp}/negotiations/request` — initiates a new negotiation,
 /// `REQUESTED`. Always accepted: this bootstrap's stub policy never
 /// rejects an offer at this stage (see `../../../ARCHITECTURE.md`), unless
-/// it is past the size limits above.
+/// it is past the size limits above. With a `callbackAddress`, the
+/// Provider then agrees on its own ([`agree`]).
 pub async fn initiate_negotiation(
     State(state): State<Arc<AppState>>,
     Json(msg): Json<ContractRequestMessage>,
@@ -184,9 +185,15 @@ pub async fn initiate_negotiation(
     let mut negotiation = ContractNegotiation::new(provider_pid, msg.consumer_pid.clone());
     negotiation.dataset_id = msg.offer.target.clone();
     negotiation.offer = Some(msg.offer);
+    negotiation.callback_address = msg.callback_address;
     let stored = negotiation.clone();
     match state.with_graph(move |g| g.put_negotiation(&stored)).await {
-        Ok(()) => (StatusCode::CREATED, Json(negotiation.to_ack())).into_response(),
+        Ok(()) => {
+            if negotiation.callback_address.is_some() {
+                tokio::spawn(agree(state.clone(), negotiation.provider_pid.clone()));
+            }
+            (StatusCode::CREATED, Json(negotiation.to_ack())).into_response()
+        }
         Err(e) => store_error(
             Some(&negotiation.provider_pid),
             Some(&negotiation.consumer_pid),
@@ -250,16 +257,127 @@ pub async fn negotiation_event(
         )
             .into_response();
     }
-    transition(&state, &provider_pid, NegotiationState::Accepted).await
+    let response = transition(&state, &provider_pid, NegotiationState::Accepted).await;
+    if response.status() == StatusCode::OK {
+        tokio::spawn(agree(state.clone(), provider_pid));
+    }
+    response
 }
 
-/// `POST {dsp}/negotiations/:providerPid/agreement/verification`.
+/// `POST {dsp}/negotiations/:providerPid/agreement/verification` — the
+/// Consumer verifies the Agreement, `VERIFIED`; the Provider then
+/// finalizes on its own ([`finalize`]).
 pub async fn verify_agreement(
     State(state): State<Arc<AppState>>,
     Path(provider_pid): Path<String>,
     Json(_msg): Json<ContractAgreementVerificationMessage>,
 ) -> impl IntoResponse {
-    transition(&state, &provider_pid, NegotiationState::Verified).await
+    let response = transition(&state, &provider_pid, NegotiationState::Verified).await;
+    if response.status() == StatusCode::OK {
+        tokio::spawn(finalize(state.clone(), provider_pid));
+    }
+    response
+}
+
+/// The Provider agrees to the negotiation `provider_pid`'s current offer
+/// (the stub policy agrees to every offer): it stores the Agreement,
+/// moves to `AGREED`, then sends the `ContractAgreementMessage` to the
+/// Consumer's callback address. The negotiation is `AGREED` before the
+/// message leaves, so a Consumer that verifies at once finds it there. If
+/// the Consumer cannot be reached the Provider terminates the negotiation,
+/// since the Consumer would otherwise never learn of the Agreement.
+pub async fn agree(state: Arc<AppState>, provider_pid: String) {
+    let assigner = state.config.agent_id.clone();
+    let pid = provider_pid.clone();
+    let agreed = state
+        .with_graph(move |g| {
+            g.update_negotiation(&pid, |n| {
+                let callback = n
+                    .callback_address
+                    .clone()
+                    .ok_or_else(|| "no callbackAddress to send the agreement to".to_string())?;
+                // Without DCP the Consumer has no verified participant id
+                // yet; its consumerPid is the only name this Provider has
+                // for it.
+                let assignee = n.consumer_pid.clone();
+                let id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
+                let agreement = n
+                    .agree(id, assigner, assignee, chrono::Utc::now())
+                    .map_err(|e| e.to_string())?
+                    .clone();
+                Ok::<_, String>((agreement, n.consumer_pid.clone(), callback))
+            })
+        })
+        .await;
+    let (agreement, consumer_pid, callback) = match agreed {
+        Ok(Some(Ok(agreed))) => agreed,
+        Ok(Some(Err(reason))) => {
+            tracing::warn!(%provider_pid, %reason, "not agreeing to negotiation");
+            return;
+        }
+        Ok(None) => return,
+        Err(error) => {
+            tracing::error!(%provider_pid, %error, "negotiation store error while agreeing");
+            return;
+        }
+    };
+    if let Err(error) = state
+        .callbacks
+        .send_agreement(&callback, &provider_pid, &consumer_pid, agreement)
+        .await
+    {
+        tracing::warn!(%provider_pid, %callback, %error, "could not send the agreement; terminating");
+        let pid = provider_pid.clone();
+        let terminated = state
+            .with_graph(move |g| {
+                g.update_negotiation(&pid, |n| n.transition(NegotiationState::Terminated))
+            })
+            .await;
+        if let Err(error) = terminated {
+            tracing::error!(%provider_pid, %error, "negotiation store error while terminating");
+        }
+    }
+}
+
+/// The Provider finalizes the verified negotiation `provider_pid`:
+/// `FINALIZED`, which is what makes its Agreement grant transfers, then
+/// the `FINALIZED` event to the Consumer. The Consumer has already
+/// verified, so a failed delivery is logged and the negotiation stays
+/// finalized.
+pub async fn finalize(state: Arc<AppState>, provider_pid: String) {
+    let pid = provider_pid.clone();
+    let finalized = state
+        .with_graph(move |g| {
+            g.update_negotiation(&pid, |n| {
+                n.transition(NegotiationState::Finalized)
+                    .map_err(|e| e.to_string())?;
+                Ok::<_, String>((n.consumer_pid.clone(), n.callback_address.clone()))
+            })
+        })
+        .await;
+    let (consumer_pid, callback) = match finalized {
+        Ok(Some(Ok(finalized))) => finalized,
+        Ok(Some(Err(reason))) => {
+            tracing::warn!(%provider_pid, %reason, "not finalizing negotiation");
+            return;
+        }
+        Ok(None) => return,
+        Err(error) => {
+            tracing::error!(%provider_pid, %error, "negotiation store error while finalizing");
+            return;
+        }
+    };
+    let Some(callback) = callback else {
+        tracing::warn!(%provider_pid, "finalized, but no callbackAddress to tell the consumer");
+        return;
+    };
+    if let Err(error) = state
+        .callbacks
+        .send_finalized(&callback, &provider_pid, &consumer_pid)
+        .await
+    {
+        tracing::warn!(%provider_pid, %callback, %error, "could not send the finalized event");
+    }
 }
 
 /// `POST {dsp}/negotiations/:providerPid/termination`.

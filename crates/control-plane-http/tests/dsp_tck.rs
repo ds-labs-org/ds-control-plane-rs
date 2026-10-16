@@ -49,6 +49,8 @@ use std::path::{self, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
+use control_plane_core::common::Agreement;
+use control_plane_core::negotiation::{ContractNegotiation, NegotiationState};
 use control_plane_http::config::Config;
 use futures::FutureExt;
 use futures::future::BoxFuture;
@@ -146,6 +148,30 @@ const EXPECTED_FAILURES: &[&str] = &[
     "TP_C:03-06",
 ];
 
+/// Must match every `TP_NN_NN_AGREEMENTID` in dsp.tck.properties.
+const TCK_AGREEMENT_ID: &str = "urn:uuid:control-plane-rs-tck-agreement";
+
+/// A finalized negotiation holding [`TCK_AGREEMENT_ID`].
+fn tck_agreement_negotiation() -> ContractNegotiation {
+    let mut n = ContractNegotiation::new(
+        "urn:uuid:control-plane-rs-tck-negotiation",
+        "urn:uuid:control-plane-rs-tck-consumer",
+    );
+    n.state = NegotiationState::Finalized;
+    n.agreement = Some(Agreement {
+        id: TCK_AGREEMENT_ID.to_string(),
+        type_: "Agreement".to_string(),
+        target: control_plane_http::state::SEED_DATASET_ID.to_string(),
+        timestamp: chrono::Utc::now(),
+        assigner: "urn:connector:ds-control-plane-rs".to_string(),
+        assignee: "urn:uuid:control-plane-rs-tck-consumer".to_string(),
+        permission: vec![],
+        prohibition: vec![],
+        obligation: vec![],
+    });
+    n
+}
+
 fn properties_path() -> PathBuf {
     PathBuf::from(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -173,6 +199,12 @@ async fn dsp_tck_matches_documented_bootstrap_scope() {
     let app = control_plane_http::build(config)
         .await
         .expect("failed to build the control plane app");
+    // The `TP` tests open transfers under `TP_NN_NN_AGREEMENTID` from
+    // dsp.tck.properties, and a transfer needs an agreement this connector
+    // has finalized, so one is stored before the run.
+    app.graph
+        .put_negotiation(&tck_agreement_negotiation())
+        .expect("failed to store the TCK agreement");
     tokio::spawn(async move {
         let _ = control_plane_http::serve(app).await;
     });

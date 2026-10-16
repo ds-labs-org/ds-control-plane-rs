@@ -7,6 +7,7 @@
 //! See `../../ARCHITECTURE.md` for what this bootstrap implements,
 //! stubs, and leaves out of scope.
 
+pub mod callback;
 pub mod catalog;
 pub mod config;
 pub mod metadata;
