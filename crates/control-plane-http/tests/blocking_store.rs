@@ -43,7 +43,6 @@ fn initiate_request() -> Request<Body> {
             "target": "urn:uuid:control-plane-rs-seed-dataset",
             "permission": [{ "action": "use" }],
         },
-        "callbackAddress": "http://consumer.example/callback",
     });
     Request::builder()
         .method("POST")

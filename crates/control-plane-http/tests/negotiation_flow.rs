@@ -1,0 +1,342 @@
+//! The Provider moves a negotiation on by itself: it agrees to a request
+//! and sends the Agreement to the Consumer's `callbackAddress`, finalizes
+//! once the Consumer verifies, and only starts transfers under an
+//! agreement it has finalized. A small axum server stands in for the
+//! Consumer and records what it receives.
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use axum::Json;
+use axum::body::Body;
+use axum::extract::{Path, State};
+use axum::http::{Request, StatusCode};
+use axum::routing::post;
+use control_plane_http::config::Config;
+use serde_json::{Value, json};
+use tower::ServiceExt;
+
+const DSP: &str = "/dsp/2025-1";
+
+#[derive(Clone, Default)]
+struct Consumer {
+    received: Arc<Mutex<Vec<(String, Value)>>>,
+}
+
+impl Consumer {
+    fn received(&self) -> Vec<(String, Value)> {
+        self.received.lock().unwrap().clone()
+    }
+}
+
+async fn record(
+    State(consumer): State<Consumer>,
+    Path((pid, kind)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> StatusCode {
+    consumer
+        .received
+        .lock()
+        .unwrap()
+        .push((format!("/negotiations/{pid}/{kind}"), body));
+    StatusCode::OK
+}
+
+/// Starts the stand-in Consumer; returns it and its callback address.
+async fn consumer() -> (Consumer, String) {
+    let consumer = Consumer::default();
+    let router = axum::Router::new()
+        .route("/callback/negotiations/{pid}/{kind}", post(record))
+        .with_state(consumer.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (consumer, format!("http://{addr}/callback"))
+}
+
+async fn app() -> control_plane_http::App {
+    control_plane_http::build(Config {
+        port: 0,
+        ..Config::default()
+    })
+    .await
+    .unwrap()
+}
+
+async fn call(
+    router: &axum::Router,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method(method)
+        .uri(format!("{DSP}{uri}"))
+        .header("content-type", "application/json")
+        .body(match body {
+            Some(b) => Body::from(b.to_string()),
+            None => Body::empty(),
+        })
+        .unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+fn request(consumer_pid: &str, callback: Option<&str>) -> Value {
+    let mut msg = json!({
+        "@context": ["https://w3id.org/dspace/2025/1/context.jsonld"],
+        "@type": "ContractRequestMessage",
+        "consumerPid": consumer_pid,
+        "offer": {
+            "@id": "urn:uuid:control-plane-rs-seed-offer",
+            "@type": "Offer",
+            "target": "urn:uuid:control-plane-rs-seed-dataset",
+            "permission": [{"action": "use"}]
+        }
+    });
+    if let Some(callback) = callback {
+        msg["callbackAddress"] = json!(callback);
+    }
+    msg
+}
+
+/// Polls the negotiation until it reaches `state`, failing after a while.
+async fn wait_for_state(router: &axum::Router, provider_pid: &str, state: &str) -> Value {
+    let mut last = Value::Null;
+    for _ in 0..100 {
+        let (status, ack) = call(
+            router,
+            "GET",
+            &format!("/negotiations/{provider_pid}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        if ack["state"] == state {
+            return ack;
+        }
+        last = ack;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("negotiation never reached {state}; last seen {last}");
+}
+
+async fn wait_for_messages(consumer: &Consumer, n: usize) -> Vec<(String, Value)> {
+    for _ in 0..100 {
+        let received = consumer.received();
+        if received.len() >= n {
+            return received;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "consumer received {:?}, expected {n} messages",
+        consumer.received()
+    );
+}
+
+/// Runs a negotiation to FINALIZED; returns its providerPid and agreement id.
+async fn finalized(router: &axum::Router, consumer: &Consumer, callback: &str) -> (String, String) {
+    let (status, ack) = call(
+        router,
+        "POST",
+        "/negotiations/request",
+        Some(request("urn:uuid:c1", Some(callback))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let provider_pid = ack["providerPid"].as_str().unwrap().to_string();
+    wait_for_state(router, &provider_pid, "AGREED").await;
+    let agreement = wait_for_messages(consumer, 1).await[0].1["agreement"]["@id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (status, _) = call(
+        router,
+        "POST",
+        &format!("/negotiations/{provider_pid}/agreement/verification"),
+        Some(json!({
+            "@context": ["https://w3id.org/dspace/2025/1/context.jsonld"],
+            "@type": "ContractAgreementVerificationMessage",
+            "providerPid": provider_pid,
+            "consumerPid": "urn:uuid:c1"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    wait_for_state(router, &provider_pid, "FINALIZED").await;
+    (provider_pid, agreement)
+}
+
+#[tokio::test]
+async fn the_provider_agrees_to_a_request_and_sends_the_agreement() {
+    let (consumer, callback) = consumer().await;
+    let app = app().await;
+    let (status, ack) = call(
+        &app.router,
+        "POST",
+        "/negotiations/request",
+        Some(request("urn:uuid:c1", Some(&callback))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(ack["state"], "REQUESTED");
+    let provider_pid = ack["providerPid"].as_str().unwrap().to_string();
+
+    wait_for_state(&app.router, &provider_pid, "AGREED").await;
+    let received = wait_for_messages(&consumer, 1).await;
+    let (path, msg) = &received[0];
+    assert_eq!(path, "/negotiations/urn:uuid:c1/agreement");
+    assert_eq!(msg["@type"], "ContractAgreementMessage");
+    assert_eq!(msg["providerPid"], provider_pid.as_str());
+    assert_eq!(msg["consumerPid"], "urn:uuid:c1");
+    let agreement = &msg["agreement"];
+    assert_eq!(agreement["@type"], "Agreement");
+    assert_eq!(
+        agreement["target"],
+        "urn:uuid:control-plane-rs-seed-dataset"
+    );
+    assert_eq!(agreement["assigner"], "urn:connector:ds-control-plane-rs");
+    assert_eq!(agreement["permission"][0]["action"], "use");
+    assert!(agreement["@id"].as_str().unwrap().starts_with("urn:uuid:"));
+    assert!(agreement["timestamp"].is_string());
+
+    let stored = app.graph.negotiation(&provider_pid).unwrap().unwrap();
+    assert_eq!(
+        stored.agreement.unwrap().id,
+        agreement["@id"].as_str().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn the_provider_finalizes_once_the_consumer_verifies() {
+    let (consumer, callback) = consumer().await;
+    let app = app().await;
+    let (provider_pid, agreement_id) = finalized(&app.router, &consumer, &callback).await;
+
+    let received = wait_for_messages(&consumer, 2).await;
+    let (path, msg) = &received[1];
+    assert_eq!(path, "/negotiations/urn:uuid:c1/events");
+    assert_eq!(msg["@type"], "ContractNegotiationEventMessage");
+    assert_eq!(msg["eventType"], "FINALIZED");
+    assert_eq!(msg["providerPid"], provider_pid.as_str());
+    assert_eq!(msg["consumerPid"], "urn:uuid:c1");
+    assert!(app.graph.agreement(&agreement_id).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn an_unreachable_consumer_terminates_the_negotiation() {
+    // Bind and drop a listener so the port is very likely closed.
+    let closed = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    };
+    let app = app().await;
+    let (_, ack) = call(
+        &app.router,
+        "POST",
+        "/negotiations/request",
+        Some(request(
+            "urn:uuid:c1",
+            Some(&format!("http://{closed}/callback")),
+        )),
+    )
+    .await;
+    let provider_pid = ack["providerPid"].as_str().unwrap().to_string();
+    wait_for_state(&app.router, &provider_pid, "TERMINATED").await;
+}
+
+#[tokio::test]
+async fn without_a_callback_address_the_negotiation_waits() {
+    let app = app().await;
+    let (_, ack) = call(
+        &app.router,
+        "POST",
+        "/negotiations/request",
+        Some(request("urn:uuid:c1", None)),
+    )
+    .await;
+    let provider_pid = ack["providerPid"].as_str().unwrap().to_string();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (_, ack) = call(
+        &app.router,
+        "GET",
+        &format!("/negotiations/{provider_pid}"),
+        None,
+    )
+    .await;
+    assert_eq!(ack["state"], "REQUESTED");
+}
+
+fn transfer_request(agreement_id: &str) -> Value {
+    json!({
+        "@context": ["https://w3id.org/dspace/2025/1/context.jsonld"],
+        "@type": "TransferRequestMessage",
+        "consumerPid": "urn:uuid:t1",
+        "agreementId": agreement_id,
+        "format": "HttpData-PULL",
+        "callbackAddress": "http://consumer.example/callback"
+    })
+}
+
+#[tokio::test]
+async fn a_transfer_needs_a_finalized_agreement() {
+    let (consumer, callback) = consumer().await;
+    let app = app().await;
+
+    let (status, err) = call(
+        &app.router,
+        "POST",
+        "/transfers/request",
+        Some(transfer_request("urn:uuid:unknown")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(err["@type"], "TransferError");
+    assert_eq!(err["consumerPid"], "urn:uuid:t1");
+
+    let (_, agreement_id) = finalized(&app.router, &consumer, &callback).await;
+    let (status, ack) = call(
+        &app.router,
+        "POST",
+        "/transfers/request",
+        Some(transfer_request(&agreement_id)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(ack["state"], "REQUESTED");
+}
+
+#[tokio::test]
+async fn an_agreed_but_unverified_agreement_does_not_start_a_transfer() {
+    let (consumer, callback) = consumer().await;
+    let app = app().await;
+    let (_, ack) = call(
+        &app.router,
+        "POST",
+        "/negotiations/request",
+        Some(request("urn:uuid:c1", Some(&callback))),
+    )
+    .await;
+    let provider_pid = ack["providerPid"].as_str().unwrap().to_string();
+    wait_for_state(&app.router, &provider_pid, "AGREED").await;
+    let agreement_id = wait_for_messages(&consumer, 1).await[0].1["agreement"]["@id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (status, _) = call(
+        &app.router,
+        "POST",
+        "/transfers/request",
+        Some(transfer_request(&agreement_id)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}

@@ -4,6 +4,8 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use control_plane_core::common::Agreement;
+use control_plane_core::negotiation::{ContractNegotiation, NegotiationState};
 use control_plane_http::config::Config;
 use tower::ServiceExt;
 
@@ -40,6 +42,24 @@ async fn call(
     (status, json)
 }
 
+/// A finalized negotiation holding the agreement `urn:uuid:agreement`.
+fn finalized_negotiation() -> ContractNegotiation {
+    let mut n = ContractNegotiation::new("urn:uuid:finalized", "urn:uuid:consumer-f");
+    n.state = NegotiationState::Finalized;
+    n.agreement = Some(Agreement {
+        id: "urn:uuid:agreement".to_string(),
+        type_: "Agreement".to_string(),
+        target: "urn:uuid:control-plane-rs-seed-dataset".to_string(),
+        timestamp: chrono::Utc::now(),
+        assigner: "urn:connector:ds-control-plane-rs".to_string(),
+        assignee: "urn:uuid:consumer-f".to_string(),
+        permission: vec![],
+        prohibition: vec![],
+        obligation: vec![],
+    });
+    n
+}
+
 #[tokio::test]
 async fn runtime_state_and_catalog_survive_a_restart() {
     let dir = tempfile::tempdir().unwrap();
@@ -62,7 +82,6 @@ async fn runtime_state_and_catalog_survive_a_restart() {
                     "target": "urn:uuid:control-plane-rs-seed-dataset",
                     "permission": [{ "action": "use" }],
                 },
-                "callbackAddress": "http://consumer.example/callback",
             })),
         )
         .await;
@@ -83,6 +102,8 @@ async fn runtime_state_and_catalog_survive_a_restart() {
         .await;
         assert_eq!(status, StatusCode::OK);
 
+        // A transfer needs an agreement this connector has finalized.
+        app.graph.put_negotiation(&finalized_negotiation()).unwrap();
         let (status, ack) = call(
             &app.router,
             "POST",

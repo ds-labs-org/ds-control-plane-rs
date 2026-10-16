@@ -702,3 +702,61 @@ fn a_dataset_stored_without_modified_still_reads_as_unchanged_since_the_epoch() 
     assert_eq!(records[0].modified, chrono::DateTime::UNIX_EPOCH);
     assert!(graph.dataset("urn:uuid:legacy").unwrap().is_some());
 }
+
+#[test]
+fn the_callback_address_round_trips() {
+    let graph = ControlPlaneGraph::open_in_memory().unwrap();
+    let mut n = negotiation();
+    n.callback_address = Some("http://consumer.example/callback".to_string());
+    graph.put_negotiation(&n).unwrap();
+    let back = graph.negotiation("urn:uuid:n1").unwrap().unwrap();
+    assert_eq!(
+        back.callback_address.as_deref(),
+        Some("http://consumer.example/callback")
+    );
+}
+
+#[test]
+fn an_agreement_is_found_only_once_its_negotiation_is_finalized() {
+    let graph = ControlPlaneGraph::open_in_memory().unwrap();
+    let mut n = negotiation();
+    n.state = NegotiationState::Agreed;
+    graph.put_negotiation(&n).unwrap();
+    assert!(graph.agreement("urn:uuid:agreement").unwrap().is_none());
+
+    n.state = NegotiationState::Finalized;
+    graph.put_negotiation(&n).unwrap();
+    let found = graph.agreement("urn:uuid:agreement").unwrap().unwrap();
+    assert_eq!(Some(&found), n.agreement.as_ref());
+
+    assert!(graph.agreement("urn:uuid:other").unwrap().is_none());
+    assert!(graph.agreement("} INSERT DATA {").unwrap().is_none());
+}
+
+#[test]
+fn an_offer_id_is_not_mistaken_for_an_agreement() {
+    let graph = ControlPlaneGraph::open_in_memory().unwrap();
+    let mut n = negotiation();
+    n.state = NegotiationState::Finalized;
+    graph.put_negotiation(&n).unwrap();
+    assert!(graph.agreement("urn:uuid:offer").unwrap().is_none());
+}
+
+#[test]
+fn eviction_keeps_finalized_negotiations_over_newer_open_ones() {
+    let graph = ControlPlaneGraph::open_in_memory().unwrap();
+    let mut finalized = negotiation();
+    finalized.provider_pid = "urn:uuid:finalized".to_string();
+    finalized.state = NegotiationState::Finalized;
+    graph.put_negotiation(&finalized).unwrap();
+    for i in 0..MAX_NEGOTIATIONS {
+        let mut n = negotiation();
+        n.provider_pid = format!("urn:uuid:open{i}");
+        n.agreement = None;
+        graph.put_negotiation(&n).unwrap();
+    }
+    assert_eq!(graph.negotiation_count().unwrap(), MAX_NEGOTIATIONS);
+    assert!(graph.negotiation("urn:uuid:finalized").unwrap().is_some());
+    assert!(graph.negotiation("urn:uuid:open0").unwrap().is_none());
+    assert!(graph.agreement("urn:uuid:agreement").unwrap().is_some());
+}

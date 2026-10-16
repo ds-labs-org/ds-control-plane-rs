@@ -373,4 +373,68 @@ mod tests {
             "state must not change on a rejected transition"
         );
     }
+
+    fn requested_with_offer() -> ContractNegotiation {
+        let mut n = ContractNegotiation::new("p1", "c1");
+        n.dataset_id = Some("urn:uuid:dataset".to_string());
+        n.offer = Some(Offer {
+            id: "urn:uuid:offer".to_string(),
+            type_: "Offer".to_string(),
+            target: Some("urn:uuid:dataset".to_string()),
+            permission: vec![crate::common::Rule {
+                action: "use".to_string(),
+                constraint: vec![],
+            }],
+            prohibition: vec![],
+            obligation: vec![],
+        });
+        n
+    }
+
+    #[test]
+    fn agreeing_builds_the_agreement_from_the_offer() {
+        let mut n = requested_with_offer();
+        let now = chrono::Utc::now();
+        let agreement = n
+            .agree("urn:uuid:agreement", "urn:provider", "urn:consumer", now)
+            .unwrap()
+            .clone();
+        assert_eq!(n.state, NegotiationState::Agreed);
+        assert_eq!(agreement.id, "urn:uuid:agreement");
+        assert_eq!(agreement.target, "urn:uuid:dataset");
+        assert_eq!(agreement.assigner, "urn:provider");
+        assert_eq!(agreement.assignee, "urn:consumer");
+        assert_eq!(agreement.timestamp, now);
+        assert_eq!(agreement.permission, n.offer.as_ref().unwrap().permission);
+        assert_eq!(n.agreement.as_ref(), Some(&agreement));
+    }
+
+    #[test]
+    fn agreeing_falls_back_to_the_dataset_when_the_offer_has_no_target() {
+        let mut n = requested_with_offer();
+        n.offer.as_mut().unwrap().target = None;
+        let agreement = n
+            .agree("urn:uuid:a", "urn:p", "urn:c", chrono::Utc::now())
+            .unwrap();
+        assert_eq!(agreement.target, "urn:uuid:dataset");
+    }
+
+    #[test]
+    fn agreeing_without_an_offer_or_from_a_late_state_changes_nothing() {
+        let mut n = ContractNegotiation::new("p1", "c1");
+        assert!(matches!(
+            n.agree("urn:uuid:a", "urn:p", "urn:c", chrono::Utc::now()),
+            Err(NegotiationError::NoOffer)
+        ));
+        assert_eq!(n.state, NegotiationState::Requested);
+        assert!(n.agreement.is_none());
+
+        let mut n = requested_with_offer();
+        n.state = NegotiationState::Verified;
+        assert!(matches!(
+            n.agree("urn:uuid:a", "urn:p", "urn:c", chrono::Utc::now()),
+            Err(NegotiationError::InvalidTransition { .. })
+        ));
+        assert!(n.agreement.is_none());
+    }
 }
