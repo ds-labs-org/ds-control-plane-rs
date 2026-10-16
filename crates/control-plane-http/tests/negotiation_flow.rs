@@ -340,3 +340,53 @@ async fn an_agreed_but_unverified_agreement_does_not_start_a_transfer() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+fn termination(provider_pid: &str) -> Value {
+    json!({
+        "@context": ["https://w3id.org/dspace/2025/1/context.jsonld"],
+        "@type": "ContractNegotiationTerminationMessage",
+        "providerPid": provider_pid,
+        "consumerPid": "urn:uuid:c1",
+        "code": "cancelled"
+    })
+}
+
+/// The Provider can terminate a negotiation on its own (an undeliverable
+/// agreement), so a Consumer terminating it too must not be an error.
+#[tokio::test]
+async fn terminating_an_already_terminated_negotiation_succeeds() {
+    let app = app().await;
+    let (_, ack) = call(
+        &app.router,
+        "POST",
+        "/negotiations/request",
+        Some(request("urn:uuid:c1", None)),
+    )
+    .await;
+    let provider_pid = ack["providerPid"].as_str().unwrap().to_string();
+    let uri = format!("/negotiations/{provider_pid}/termination");
+    let (status, _) = call(&app.router, "POST", &uri, Some(termination(&provider_pid))).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call(&app.router, "POST", &uri, Some(termination(&provider_pid))).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, ack) = call(
+        &app.router,
+        "GET",
+        &format!("/negotiations/{provider_pid}"),
+        None,
+    )
+    .await;
+    assert_eq!(ack["state"], "TERMINATED");
+}
+
+/// A finalized negotiation stays final: terminating it is still an error.
+#[tokio::test]
+async fn terminating_a_finalized_negotiation_is_still_rejected() {
+    let (consumer, callback) = consumer().await;
+    let app = app().await;
+    let (provider_pid, _) = finalized(&app.router, &consumer, &callback).await;
+    let uri = format!("/negotiations/{provider_pid}/termination");
+    let (status, err) = call(&app.router, "POST", &uri, Some(termination(&provider_pid))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(err["@type"], "ContractNegotiationError");
+}
