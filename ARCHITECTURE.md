@@ -90,7 +90,10 @@ side of a connector.
   a `callbackAddress`, it builds an `Agreement` from the offer (its rules,
   its `target`, this connector's `agent_id` as assigner), stores it,
   moves to `AGREED` and only then sends the `ContractAgreementMessage` to
-  `{callbackAddress}/negotiations/:consumerPid/agreement`. A consumer
+  `{callbackAddress}/negotiations/:consumerPid/agreement` (the pid
+  percent-encoded as one segment; a request whose `callbackAddress` is not
+  a plain `http(s)` URL without query or fragment, or whose `consumerPid`
+  is `.` or `..`, is a 400). A consumer
   `ACCEPTED` event does the same. After the Consumer's verification it
   moves to `FINALIZED` and sends the `FINALIZED` event to
   `.../:consumerPid/events`. An agreement grants transfers only once its

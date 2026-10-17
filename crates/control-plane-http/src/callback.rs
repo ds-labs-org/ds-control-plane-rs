@@ -27,6 +27,28 @@ pub enum CallbackError {
     Request(#[from] reqwest::Error),
     #[error("consumer answered {0}")]
     Status(reqwest::StatusCode),
+    #[error("{0}")]
+    Unusable(String),
+}
+
+/// Why `callback` and `consumer_pid` cannot make the callback URLs, or
+/// `Ok` if they can. The DSP path is appended to the callback address, so
+/// it must be a plain `http(s)` URL with no query or fragment; and the URL
+/// parser resolves a `.` or `..` segment away even when percent-encoded,
+/// so such a pid can never be sent as one segment.
+pub fn check(callback: &str, consumer_pid: &str) -> Result<(), String> {
+    let parsed =
+        reqwest::Url::parse(callback).map_err(|e| format!("callbackAddress is not a URL: {e}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("callbackAddress must be an http or https URL".to_string());
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("callbackAddress must not have a query or fragment".to_string());
+    }
+    if matches!(consumer_pid, "." | "..") {
+        return Err("consumerPid cannot be a URL path segment".to_string());
+    }
+    Ok(())
 }
 
 /// The HTTP client for Consumer callbacks.
@@ -66,6 +88,7 @@ impl Callbacks {
             consumer_pid: consumer_pid.to_string(),
             agreement,
         };
+        check(callback, consumer_pid).map_err(CallbackError::Unusable)?;
         self.post(&url(callback, consumer_pid, "agreement"), &msg)
             .await
     }
@@ -84,6 +107,7 @@ impl Callbacks {
             consumer_pid: consumer_pid.to_string(),
             event_type: NegotiationEventType::Finalized,
         };
+        check(callback, consumer_pid).map_err(CallbackError::Unusable)?;
         self.post(&url(callback, consumer_pid, "events"), &msg)
             .await
     }
@@ -105,6 +129,7 @@ impl Callbacks {
             code: Some(code.to_string()),
             reason: vec![reason],
         };
+        check(callback, consumer_pid).map_err(CallbackError::Unusable)?;
         self.post(&url(callback, consumer_pid, "termination"), &msg)
             .await
     }
@@ -119,8 +144,9 @@ impl Callbacks {
     }
 }
 
-/// `{callback}/negotiations/{consumer_pid}/{last}`, with the pid escaped
-/// just enough that it stays one path segment.
+/// `{callback}/negotiations/{consumer_pid}/{last}`, with every byte of the
+/// pid outside RFC 3986 unreserved characters, `:` and `@` percent-encoded,
+/// so it stays one path segment for any pid [`check`] accepts.
 fn url(callback: &str, consumer_pid: &str, last: &str) -> String {
     format!(
         "{}/negotiations/{}/{last}",
@@ -131,10 +157,11 @@ fn url(callback: &str, consumer_pid: &str, last: &str) -> String {
 
 fn segment(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
-    for c in value.chars() {
-        match c {
-            '/' | '?' | '#' | '%' | ' ' => out.push_str(&format!("%{:02X}", c as u32)),
-            c => out.push(c),
+    for b in value.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b':' | b'@') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
         }
     }
     out
@@ -145,7 +172,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_consumer_pid_stays_one_path_segment() {
+    fn the_consumer_pid_is_escaped() {
         assert_eq!(
             url("http://c.example/cb/", "urn:uuid:c1", "agreement"),
             "http://c.example/cb/negotiations/urn:uuid:c1/agreement"

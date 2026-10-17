@@ -242,7 +242,8 @@ pub async fn get_negotiation(
 /// rejects an offer at this stage (see `../../../ARCHITECTURE.md`), unless
 /// it has no permission or prohibition, is past the size limits above, or
 /// carries terms the model cannot hold
-/// ([`unrepresentable`]). With a `callbackAddress`, the
+/// ([`unrepresentable`]), or its `callbackAddress` cannot carry the DSP
+/// callback paths ([`crate::callback::check`]). With a `callbackAddress`, the
 /// Provider then agrees on its own ([`agree`]).
 pub async fn initiate_negotiation(
     State(state): State<Arc<AppState>>,
@@ -252,7 +253,14 @@ pub async fn initiate_negotiation(
         msg,
         unrepresentable,
     } = msg;
-    if let Some(reason) = unrepresentable.or_else(|| invalid_offer(&msg.offer)) {
+    let unusable_callback = || {
+        let callback = msg.callback_address.as_deref()?;
+        crate::callback::check(callback, &msg.consumer_pid).err()
+    };
+    if let Some(reason) = unrepresentable
+        .or_else(|| invalid_offer(&msg.offer))
+        .or_else(unusable_callback)
+    {
         return rejected_offer(None, &msg.consumer_pid, reason);
     }
     let provider_pid = format!("urn:uuid:{}", uuid::Uuid::new_v4());
