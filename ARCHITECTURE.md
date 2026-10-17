@@ -95,8 +95,9 @@ side of a connector.
   moves to `FINALIZED` and sends the `FINALIZED` event to
   `.../:consumerPid/events`. An agreement grants transfers only once its
   negotiation is `FINALIZED` (`ControlPlaneGraph::agreement`). If the
-  agreement cannot be delivered the Provider terminates the negotiation
-  and sends a best-effort `ContractNegotiationTerminationMessage` to
+  agreement cannot be delivered the Provider terminates the negotiation,
+  unless the Consumer has verified it meanwhile (it is no longer
+  `AGREED`), and sends a best-effort `ContractNegotiationTerminationMessage` to
   `.../:consumerPid/termination` (the Consumer may have stored the
   Agreement despite the failure, e.g. after a timeout); a later Consumer
   termination of it is a 200, not an error. Without a

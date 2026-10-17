@@ -286,7 +286,9 @@ pub async fn verify_agreement(
 /// message leaves, so a Consumer that verifies at once finds it there. If
 /// the Consumer cannot be reached the Provider terminates the negotiation,
 /// since the Consumer would otherwise never learn of the Agreement, and
-/// sends it a best-effort `ContractNegotiationTerminationMessage`.
+/// sends it a best-effort `ContractNegotiationTerminationMessage` -- unless
+/// the negotiation has left `AGREED` meanwhile (a verification proves the
+/// Consumer got the Agreement despite the failed reply).
 pub async fn agree(state: Arc<AppState>, provider_pid: String) {
     let assigner = state.config.agent_id.clone();
     let pid = provider_pid.clone();
@@ -322,6 +324,7 @@ pub async fn agree(state: Arc<AppState>, provider_pid: String) {
             return;
         }
     };
+    let agreement_id = agreement.id.clone();
     if let Err(error) = state
         .callbacks
         .send_agreement(&callback, &provider_pid, &consumer_pid, agreement)
@@ -329,13 +332,27 @@ pub async fn agree(state: Arc<AppState>, provider_pid: String) {
     {
         tracing::warn!(%provider_pid, %callback, %error, "could not send the agreement; terminating");
         let pid = provider_pid.clone();
+        // Terminate only the negotiation as this call left it: a Consumer
+        // that has verified meanwhile holds the Agreement after all.
         let terminated = state
             .with_graph(move |g| {
-                g.update_negotiation(&pid, |n| n.transition(NegotiationState::Terminated))
+                g.update_negotiation(&pid, |n| {
+                    let unanswered = n.state == NegotiationState::Agreed
+                        && n.agreement.as_ref().map(|a| &a.id) == Some(&agreement_id);
+                    if unanswered {
+                        n.transition(NegotiationState::Terminated).map(|()| true)
+                    } else {
+                        Ok(false)
+                    }
+                })
             })
             .await;
         match terminated {
-            Ok(Some(Ok(()))) => {}
+            Ok(Some(Ok(true))) => {}
+            Ok(Some(Ok(false))) => {
+                tracing::info!(%provider_pid, "the consumer verified the agreement anyway; not terminating");
+                return;
+            }
             Ok(Some(Err(reason))) => {
                 tracing::warn!(%provider_pid, %reason, "not terminating negotiation");
                 return;
