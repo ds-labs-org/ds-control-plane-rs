@@ -97,8 +97,11 @@ side of a connector.
   `ACCEPTED` event does the same. After the Consumer's verification it
   moves to `FINALIZED` and sends the `FINALIZED` event to
   `.../:consumerPid/events`. An agreement grants transfers only once its
-  negotiation is `FINALIZED` (`ControlPlaneGraph::agreement`). If the
-  agreement cannot be delivered the Provider terminates the negotiation,
+  negotiation is `FINALIZED` (`ControlPlaneGraph::agreement`). The
+  Agreement can reach the Consumer before it has processed the ACK of its
+  request, so a failed delivery is tried again after 0.2, 0.4 and 0.8 s
+  while the negotiation is still `AGREED`. If the
+  agreement still cannot be delivered the Provider terminates the negotiation,
   unless the Consumer has verified it meanwhile (it is no longer
   `AGREED`), and sends a best-effort `ContractNegotiationTerminationMessage` to
   `.../:consumerPid/termination` (the Consumer may have stored the

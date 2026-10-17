@@ -5,6 +5,7 @@
 //! `../../../ARCHITECTURE.md`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -19,6 +20,7 @@ use control_plane_core::negotiation::{
 use control_plane_core::common::Offer;
 use control_plane_graph::GraphError;
 
+use crate::callback::CallbackError;
 use crate::state::AppState;
 
 /// The most rules (`permission`, `prohibition` and `obligation` together)
@@ -412,7 +414,33 @@ pub async fn agree(state: Arc<AppState>, provider_pid: String) {
     deliver_agreement(state, provider_pid, consumer_pid, callback, agreement).await;
 }
 
-/// Sends `agreement` to the Consumer; on failure terminates the
+/// How long the Provider waits before each new attempt to deliver an
+/// Agreement the Consumer did not take. The Agreement can arrive before
+/// the Consumer has processed the ACK of its own request, and a Consumer
+/// may refuse it until then, so one refusal does not end the negotiation.
+pub const AGREEMENT_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(200),
+    Duration::from_millis(400),
+    Duration::from_millis(800),
+];
+
+/// Whether the negotiation `provider_pid` is still `AGREED` with the
+/// Agreement `agreement_id`, i.e. still waiting for the Consumer to take it.
+async fn awaiting_agreement(state: &AppState, provider_pid: &str, agreement_id: &str) -> bool {
+    let pid = provider_pid.to_string();
+    let id = agreement_id.to_string();
+    matches!(
+        state
+            .with_graph(move |g| g.negotiation(&pid))
+            .await,
+        Ok(Some(n)) if n.state == NegotiationState::Agreed
+            && n.agreement.as_ref().map(|a| &a.id) == Some(&id)
+    )
+}
+
+/// Sends `agreement` to the Consumer, again after each of
+/// [`AGREEMENT_RETRY_DELAYS`] while it fails and the negotiation is still
+/// `AGREED` with that Agreement; if every attempt fails terminates the
 /// negotiation if it is still `AGREED` with that Agreement, and tells the
 /// Consumer so (see [`agree`]).
 async fn deliver_agreement(
@@ -423,11 +451,25 @@ async fn deliver_agreement(
     agreement: control_plane_core::common::Agreement,
 ) {
     let agreement_id = agreement.id.clone();
-    if let Err(error) = state
-        .callbacks
-        .send_agreement(&callback, &provider_pid, &consumer_pid, agreement)
-        .await
-    {
+    let mut delays = AGREEMENT_RETRY_DELAYS.iter();
+    let sent = loop {
+        let sent = state
+            .callbacks
+            .send_agreement(&callback, &provider_pid, &consumer_pid, agreement.clone())
+            .await;
+        let retryable = !matches!(sent, Ok(()) | Err(CallbackError::Unusable(_)));
+        match delays.next() {
+            Some(delay) if retryable => {
+                tracing::info!(%provider_pid, %callback, error = %sent.unwrap_err(), "could not send the agreement; retrying");
+                tokio::time::sleep(*delay).await;
+                if !awaiting_agreement(&state, &provider_pid, &agreement_id).await {
+                    return;
+                }
+            }
+            _ => break sent,
+        }
+    };
+    if let Err(error) = sent {
         tracing::warn!(%provider_pid, %callback, %error, "could not send the agreement; terminating");
         let pid = provider_pid.clone();
         // Terminate only the negotiation as this call left it: a Consumer

@@ -298,8 +298,8 @@ async fn an_unreachable_consumer_terminates_the_negotiation() {
     wait_for_state(&app.router, &provider_pid, "TERMINATED").await;
 }
 
-/// A Consumer that rejects the Agreement is told the Provider terminated
-/// the negotiation, so both sides end up TERMINATED.
+/// A Consumer that keeps rejecting the Agreement is told the Provider
+/// terminated the negotiation, so both sides end up TERMINATED.
 #[tokio::test]
 async fn a_rejected_agreement_terminates_and_tells_the_consumer() {
     let (consumer, callback) = serve(Consumer {
@@ -317,9 +317,14 @@ async fn a_rejected_agreement_terminates_and_tells_the_consumer() {
     .await;
     let provider_pid = ack["providerPid"].as_str().unwrap().to_string();
     wait_for_state(&app.router, &provider_pid, "TERMINATED").await;
-    let received = wait_for_messages(&consumer, 2).await;
-    assert_eq!(received[0].0, "/negotiations/urn:uuid:c1/agreement");
-    let (path, msg) = &received[1];
+    // Every attempt at the Agreement, then the termination.
+    let attempts = control_plane_http::negotiation::AGREEMENT_RETRY_DELAYS.len() + 1;
+    let received = wait_for_messages(&consumer, attempts + 1).await;
+    assert_eq!(received.len(), attempts + 1, "{received:?}");
+    for (path, _) in &received[..attempts] {
+        assert_eq!(path, "/negotiations/urn:uuid:c1/agreement");
+    }
+    let (path, msg) = &received[attempts];
     assert_eq!(path, "/negotiations/urn:uuid:c1/termination");
     assert_eq!(msg["@type"], "ContractNegotiationTerminationMessage");
     assert_eq!(msg["providerPid"], provider_pid.as_str());
