@@ -95,8 +95,11 @@ side of a connector.
   moves to `FINALIZED` and sends the `FINALIZED` event to
   `.../:consumerPid/events`. An agreement grants transfers only once its
   negotiation is `FINALIZED` (`ControlPlaneGraph::agreement`). If the
-  agreement cannot be delivered the Provider terminates the negotiation,
-  so a later Consumer termination of it is a 200, not an error. Without a
+  agreement cannot be delivered the Provider terminates the negotiation
+  and sends a best-effort `ContractNegotiationTerminationMessage` to
+  `.../:consumerPid/termination` (the Consumer may have stored the
+  Agreement despite the failure, e.g. after a timeout); a later Consumer
+  termination of it is a 200, not an error. Without a
   `callbackAddress` the negotiation stays `REQUESTED`. Callbacks
   (`crates/control-plane-http/src/callback.rs`) never follow redirects and
   give up after 10 s; since the Consumer is not authenticated yet, the

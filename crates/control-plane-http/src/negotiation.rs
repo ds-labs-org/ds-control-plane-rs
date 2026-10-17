@@ -285,7 +285,8 @@ pub async fn verify_agreement(
 /// Consumer's callback address. The negotiation is `AGREED` before the
 /// message leaves, so a Consumer that verifies at once finds it there. If
 /// the Consumer cannot be reached the Provider terminates the negotiation,
-/// since the Consumer would otherwise never learn of the Agreement.
+/// since the Consumer would otherwise never learn of the Agreement, and
+/// sends it a best-effort `ContractNegotiationTerminationMessage`.
 pub async fn agree(state: Arc<AppState>, provider_pid: String) {
     let assigner = state.config.agent_id.clone();
     let pid = provider_pid.clone();
@@ -333,8 +334,32 @@ pub async fn agree(state: Arc<AppState>, provider_pid: String) {
                 g.update_negotiation(&pid, |n| n.transition(NegotiationState::Terminated))
             })
             .await;
-        if let Err(error) = terminated {
-            tracing::error!(%provider_pid, %error, "negotiation store error while terminating");
+        match terminated {
+            Ok(Some(Ok(()))) => {}
+            Ok(Some(Err(reason))) => {
+                tracing::warn!(%provider_pid, %reason, "not terminating negotiation");
+                return;
+            }
+            Ok(None) => return,
+            Err(error) => {
+                tracing::error!(%provider_pid, %error, "negotiation store error while terminating");
+                return;
+            }
+        }
+        // Best effort: the Consumer may have stored the Agreement anyway
+        // (a lost response, a timeout), so tell it the negotiation is over.
+        if let Err(error) = state
+            .callbacks
+            .send_terminated(
+                &callback,
+                &provider_pid,
+                &consumer_pid,
+                "agreement-undeliverable",
+                format!("the agreement could not be delivered: {error}"),
+            )
+            .await
+        {
+            tracing::warn!(%provider_pid, %callback, %error, "could not send the termination");
         }
     }
 }

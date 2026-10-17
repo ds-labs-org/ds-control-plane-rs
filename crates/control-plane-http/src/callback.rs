@@ -1,8 +1,9 @@
 //! Messages this Provider sends on its own to a Consumer's
 //! `callbackAddress`, per the Contract Negotiation HTTPS Binding's
 //! "Consumer Callback Path Bindings": the Agreement to
-//! `{callback}/negotiations/:consumerPid/agreement` and the `FINALIZED`
-//! event to `{callback}/negotiations/:consumerPid/events`.
+//! `{callback}/negotiations/:consumerPid/agreement`, the `FINALIZED`
+//! event to `{callback}/negotiations/:consumerPid/events` and its own
+//! termination to `{callback}/negotiations/:consumerPid/termination`.
 //!
 //! The callback address comes from the Consumer's own request and nothing
 //! authenticates that Consumer yet (no DCP), so this client never follows
@@ -13,7 +14,8 @@ use std::time::Duration;
 use control_plane_core::common::Agreement;
 use control_plane_core::dsp_context;
 use control_plane_core::negotiation::{
-    ContractAgreementMessage, ContractNegotiationEventMessage, NegotiationEventType,
+    ContractAgreementMessage, ContractNegotiationEventMessage,
+    ContractNegotiationTerminationMessage, NegotiationEventType,
 };
 
 /// How long one callback may take before this Provider gives up on it.
@@ -83,6 +85,27 @@ impl Callbacks {
             event_type: NegotiationEventType::Finalized,
         };
         self.post(&url(callback, consumer_pid, "events"), &msg)
+            .await
+    }
+
+    /// Tells the Consumer this Provider terminated the negotiation.
+    pub async fn send_terminated(
+        &self,
+        callback: &str,
+        provider_pid: &str,
+        consumer_pid: &str,
+        code: &str,
+        reason: String,
+    ) -> Result<(), CallbackError> {
+        let msg = ContractNegotiationTerminationMessage {
+            context: dsp_context(),
+            type_: "ContractNegotiationTerminationMessage".to_string(),
+            provider_pid: provider_pid.to_string(),
+            consumer_pid: consumer_pid.to_string(),
+            code: Some(code.to_string()),
+            reason: vec![reason],
+        };
+        self.post(&url(callback, consumer_pid, "termination"), &msg)
             .await
     }
 
