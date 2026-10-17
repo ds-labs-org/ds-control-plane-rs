@@ -226,7 +226,9 @@ impl ControlPlaneGraph {
 
     /// Stores `negotiation`, replacing any record with the same
     /// `providerPid`, then evicts the least recently modified negotiations
-    /// past [`MAX_NEGOTIATIONS`].
+    /// past [`MAX_NEGOTIATIONS`], `FINALIZED` ones last. The negotiation just
+    /// stored is never evicted: once every other one is `FINALIZED`, the
+    /// oldest of those goes instead.
     pub fn put_negotiation(&self, negotiation: &ContractNegotiation) -> Result<(), GraphError> {
         let _guard = self.write_guard();
         let (node, quads) = write_negotiation(negotiation)?;
@@ -236,6 +238,7 @@ impl ControlPlaneGraph {
             &graph,
             &dspace("ContractNegotiation"),
             MAX_NEGOTIATIONS,
+            node.as_ref().into(),
             is_finalized,
         )
     }
@@ -326,9 +329,13 @@ impl ControlPlaneGraph {
         let (node, quads) = write_transfer(transfer)?;
         let graph = runtime_graph();
         self.replace(&graph, &node, quads)?;
-        self.evict_oldest(&graph, &dspace("TransferProcess"), MAX_TRANSFERS, |_, _| {
-            false
-        })
+        self.evict_oldest(
+            &graph,
+            &dspace("TransferProcess"),
+            MAX_TRANSFERS,
+            node.as_ref().into(),
+            |_, _| false,
+        )
     }
 
     /// Same as [`Self::update_negotiation`], for a transfer process.

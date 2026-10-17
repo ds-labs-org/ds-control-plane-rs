@@ -278,7 +278,9 @@ of body (`crates/control-plane-http/tests/request_limits.rs`). A transfer's
 `agreementId` must name an agreement finalized here; still not checked:
 that an offer's `target` names a dataset this connector holds (the stub
 policy accepts any). Finalized negotiations hold the agreements transfers
-depend on, so eviction removes every other negotiation first.
+depend on, so eviction removes every other negotiation first; the record
+being written is never a candidate, so once every other negotiation is
+finalized a new one evicts the oldest finalized one rather than itself.
 
 ## TCK conformance snapshot
 

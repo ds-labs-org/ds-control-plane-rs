@@ -158,23 +158,30 @@ impl ControlPlaneGraph {
     /// least recently modified ones (by `dcterms:modified`, then IRI) and
     /// everything reachable from them, back down to `max`, in one
     /// transaction. Records for which `keep_longer` is true go only once
-    /// every other record is gone. A record whose timestamp is unreadable
-    /// counts as the oldest. Callers hold the write guard.
+    /// every other record is gone. `written`, the record the caller has
+    /// just stored, is never evicted, so a write cannot remove its own
+    /// record. A record whose timestamp is unreadable counts as the
+    /// oldest. Callers hold the write guard.
     pub(crate) fn evict_oldest(
         &self,
         graph: &NamedNode,
         class: &str,
         max: usize,
+        written: NamedOrBlankNodeRef<'_>,
         keep_longer: impl Fn(&Reader<'_>, NamedOrBlankNodeRef<'_>) -> bool,
     ) -> Result<(), GraphError> {
         let r = self.reader(graph);
         let nodes = r.instances(class)?;
-        if nodes.len() <= max {
+        let nodes_len = nodes.len();
+        if nodes_len <= max {
             return Ok(());
         }
         let modified = crate::vocab::dcterms("modified");
         let mut aged = Vec::with_capacity(nodes.len());
         for node in nodes {
+            if node.as_ref() == written {
+                continue;
+            }
             let at = match r.date_time(node.as_ref(), &modified) {
                 Ok(at) => at,
                 Err(e @ GraphError::Storage(_)) => return Err(e),
@@ -187,7 +194,7 @@ impl ControlPlaneGraph {
                 .then_with(|| a.cmp(b))
                 .then_with(|| x.to_string().cmp(&y.to_string()))
         });
-        let excess = aged.len() - max;
+        let excess = nodes_len - max;
         let mut old = Vec::new();
         for (_, _, node) in aged.into_iter().take(excess) {
             old.extend(self.tree(graph, node.as_ref())?);
