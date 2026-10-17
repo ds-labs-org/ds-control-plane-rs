@@ -369,6 +369,53 @@ async fn a_verified_negotiation_is_finalized_even_if_the_agreement_reply_failed(
     }
 }
 
+/// Offers carrying terms the Provider cannot hold (a duty, a remedy, a
+/// policy profile, a constraint's unit) are refused rather than agreed as
+/// a weaker copy without them.
+#[tokio::test]
+async fn an_offer_with_terms_the_provider_cannot_hold_is_refused_not_weakened() {
+    let (consumer, callback) = consumer().await;
+    let app = app().await;
+    let lossy = [
+        (
+            "/offer/permission/0/duty",
+            json!([{"action": "compensate"}]),
+        ),
+        ("/offer/permission/0/remedy", json!([{"action": "delete"}])),
+        ("/offer/profile", json!("urn:profile")),
+        (
+            "/offer/permission/0/constraint",
+            json!([{"leftOperand": "count", "operator": "lteq", "rightOperand": 5, "unit": "urn:unit"}]),
+        ),
+    ];
+    for (pointer, value) in lossy {
+        let mut msg = request("urn:uuid:c1", Some(&callback));
+        let (parent, key) = pointer.rsplit_once('/').unwrap();
+        msg.pointer_mut(parent).unwrap()[key] = value;
+        let (status, error) = call(&app.router, "POST", "/negotiations/request", Some(msg)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{pointer} was accepted");
+        assert_eq!(error["@type"], "ContractNegotiationError");
+        assert_eq!(error["consumerPid"], "urn:uuid:c1");
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        consumer.received().is_empty(),
+        "an agreement was sent: {:?}",
+        consumer.received()
+    );
+    assert!(app.graph.negotiations().unwrap().is_empty());
+
+    // Empty term lists lose nothing, and the TCK's offer shape (assigner,
+    // assignee, an empty `constraints`) is still agreed.
+    let mut msg = request("urn:uuid:c2", Some(&callback));
+    msg["offer"]["assigner"] = json!("urn:provider");
+    msg["offer"]["assignee"] = json!("urn:consumer");
+    msg["offer"]["permission"][0]["duty"] = json!([]);
+    msg["offer"]["permission"][0]["constraints"] = json!([]);
+    let (status, _) = call(&app.router, "POST", "/negotiations/request", Some(msg)).await;
+    assert_eq!(status, StatusCode::CREATED);
+}
+
 #[tokio::test]
 async fn without_a_callback_address_the_negotiation_waits() {
     let app = app().await;
