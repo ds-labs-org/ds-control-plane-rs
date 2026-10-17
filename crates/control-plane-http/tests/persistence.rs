@@ -413,3 +413,46 @@ async fn in_flight_negotiations_are_resumed_after_a_restart() {
     );
     assert!(app.graph.agreement("urn:uuid:agr-ver").unwrap().is_some());
 }
+
+/// Dropping the app releases the store even while an Agreement is still
+/// on its way to a Consumer that never answers: the background delivery
+/// does not keep the store open, so the app can be built again at once on
+/// the same directory.
+#[tokio::test]
+async fn a_pending_callback_does_not_keep_the_store_locked() {
+    // Connections complete in the backlog and are never answered.
+    let blackhole = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let callback = format!("http://{}/callback", blackhole.local_addr().unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let app = control_plane_http::build(config(dir.path(), "http://before.example"))
+            .await
+            .unwrap();
+        let (status, _) = call(
+            &app.router,
+            "POST",
+            "/dsp/2025-1/negotiations/request",
+            Some(serde_json::json!({
+                "@context": ["https://w3id.org/dspace/2025/1/context.jsonld"],
+                "@type": "ContractRequestMessage",
+                "consumerPid": "urn:uuid:consumer-slow",
+                "callbackAddress": callback,
+                "offer": {
+                    "@id": "urn:uuid:control-plane-rs-seed-offer",
+                    "@type": "Offer",
+                    "target": "urn:uuid:control-plane-rs-seed-dataset",
+                    "permission": [{ "action": "use" }],
+                },
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        // Let the agreement be stored and its delivery start.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    control_plane_http::build(config(dir.path(), "http://after.example"))
+        .await
+        .expect("the store must be released once the app is dropped");
+    drop(blackhole);
+}
