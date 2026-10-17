@@ -553,3 +553,40 @@ async fn terminating_a_finalized_negotiation_is_still_rejected() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(err["@type"], "ContractNegotiationError");
 }
+
+/// A Consumer may counter only an Offer; once the Provider has agreed, a
+/// counter-request is an error and leaves the agreed offer alone.
+#[tokio::test]
+async fn a_counter_request_after_agreement_is_rejected() {
+    let (consumer, callback) = consumer().await;
+    let app = app().await;
+    let (_, ack) = call(
+        &app.router,
+        "POST",
+        "/negotiations/request",
+        Some(request("urn:uuid:c1", Some(&callback))),
+    )
+    .await;
+    let provider_pid = ack["providerPid"].as_str().unwrap().to_string();
+    wait_for_state(&app.router, &provider_pid, "AGREED").await;
+    wait_for_messages(&consumer, 1).await;
+
+    let mut counter = request("urn:uuid:c1", None);
+    counter["providerPid"] = json!(provider_pid);
+    counter["offer"]["@id"] = json!("urn:uuid:counter");
+    counter["offer"]["permission"][0]["action"] = json!("distribute");
+    let (status, err) = call(
+        &app.router,
+        "POST",
+        &format!("/negotiations/{provider_pid}/request"),
+        Some(counter),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(err["@type"], "ContractNegotiationError");
+    let stored = app.graph.negotiation(&provider_pid).unwrap().unwrap();
+    assert_eq!(
+        stored.offer.unwrap().id,
+        "urn:uuid:control-plane-rs-seed-offer"
+    );
+}
