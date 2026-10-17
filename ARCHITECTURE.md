@@ -110,7 +110,10 @@ side of a connector.
 
 - **Policy**: always-allow. The Provider agrees to every offer as sent,
   with no ODRL constraint evaluation and no check that the offer matches
-  one in the catalog. It never counter-offers and never terminates on its
+  one in the catalog. Offers whose terms the model cannot hold (a rule's
+  `duty`, `remedy` or `consequence`, a policy `profile`, a constraint's
+  `unit`, `rightOperandReference`, `dataType` or `status`) are refused
+  with a 400 `ContractNegotiationError` rather than agreed without them. It never counter-offers and never terminates on its
   own except when an agreement cannot be delivered.
 - **Agreement assignee**: there is no DCP yet, so the Consumer has no
   verified participant id; the Agreement's `assignee` is its

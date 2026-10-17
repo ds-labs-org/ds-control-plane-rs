@@ -66,6 +66,70 @@ fn oversized(offer: &Offer) -> Option<String> {
     None
 }
 
+/// Offer, rule and constraint keys this bootstrap's model cannot hold:
+/// serde would drop them on parsing, and the Provider would then agree to
+/// a different, usually weaker, policy than the one offered (e.g. a
+/// permission without its duty).
+const UNREPRESENTABLE_OFFER_KEYS: &[&str] = &["profile"];
+const UNREPRESENTABLE_RULE_KEYS: &[&str] = &["duty", "remedy", "consequence", "constraints"];
+const UNREPRESENTABLE_CONSTRAINT_KEYS: &[&str] =
+    &["unit", "rightOperandReference", "dataType", "status"];
+
+/// The first of `keys` that `object` carries with something in it: an
+/// empty list or `null` loses nothing when dropped.
+fn present(object: &serde_json::Value, keys: &[&'static str]) -> Option<&'static str> {
+    keys.iter().copied().find(|key| match object.get(*key) {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::Array(items)) => !items.is_empty(),
+        Some(_) => true,
+    })
+}
+
+/// The first term of the raw `offer` this bootstrap cannot represent, if
+/// any. An empty list or `null` loses nothing and is let through (the TCK
+/// sends `constraints: []`).
+fn unrepresentable(offer: &serde_json::Value) -> Option<String> {
+    let refuse = |key: &str| Some(format!("an offer's `{key}` is not supported"));
+    if let Some(key) = present(offer, UNREPRESENTABLE_OFFER_KEYS) {
+        return refuse(key);
+    }
+    let rules = ["permission", "prohibition", "obligation"]
+        .into_iter()
+        .filter_map(|kind| offer.get(kind)?.as_array())
+        .flatten();
+    for rule in rules {
+        if let Some(key) = present(rule, UNREPRESENTABLE_RULE_KEYS) {
+            return refuse(key);
+        }
+        let constraints = rule.get("constraint").and_then(|c| c.as_array());
+        for constraint in constraints.into_iter().flatten() {
+            if let Some(key) = present(constraint, UNREPRESENTABLE_CONSTRAINT_KEYS) {
+                return refuse(key);
+            }
+        }
+    }
+    None
+}
+
+/// A `ContractRequestMessage` body, plus whether its raw `offer` carried
+/// terms that parsing into [`ContractRequestMessage`] dropped.
+pub struct InboundRequest {
+    msg: ContractRequestMessage,
+    unrepresentable: Option<String>,
+}
+
+impl<'de> serde::Deserialize<'de> for InboundRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        let unrepresentable = raw.get("offer").and_then(unrepresentable);
+        let msg = serde_json::from_value(raw).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            msg,
+            unrepresentable,
+        })
+    }
+}
+
 fn rejected_offer(
     provider_pid: Option<&str>,
     consumer_pid: &str,
@@ -172,13 +236,18 @@ pub async fn get_negotiation(
 /// `POST {dsp}/negotiations/request` — initiates a new negotiation,
 /// `REQUESTED`. Always accepted: this bootstrap's stub policy never
 /// rejects an offer at this stage (see `../../../ARCHITECTURE.md`), unless
-/// it is past the size limits above. With a `callbackAddress`, the
+/// it is past the size limits above or carries terms the model cannot hold
+/// ([`unrepresentable`]). With a `callbackAddress`, the
 /// Provider then agrees on its own ([`agree`]).
 pub async fn initiate_negotiation(
     State(state): State<Arc<AppState>>,
-    Json(msg): Json<ContractRequestMessage>,
+    Json(msg): Json<InboundRequest>,
 ) -> impl IntoResponse {
-    if let Some(reason) = oversized(&msg.offer) {
+    let InboundRequest {
+        msg,
+        unrepresentable,
+    } = msg;
+    if let Some(reason) = unrepresentable.or_else(|| oversized(&msg.offer)) {
         return rejected_offer(None, &msg.consumer_pid, reason);
     }
     let provider_pid = format!("urn:uuid:{}", uuid::Uuid::new_v4());
@@ -210,9 +279,13 @@ pub async fn initiate_negotiation(
 pub async fn continue_negotiation(
     State(state): State<Arc<AppState>>,
     Path(provider_pid): Path<String>,
-    Json(msg): Json<ContractRequestMessage>,
+    Json(msg): Json<InboundRequest>,
 ) -> impl IntoResponse {
-    if let Some(reason) = oversized(&msg.offer) {
+    let InboundRequest {
+        msg,
+        unrepresentable,
+    } = msg;
+    if let Some(reason) = unrepresentable.or_else(|| oversized(&msg.offer)) {
         return rejected_offer(Some(&provider_pid), &msg.consumer_pid, reason);
     }
     let pid = provider_pid.clone();
