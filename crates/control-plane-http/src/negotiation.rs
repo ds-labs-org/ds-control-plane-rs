@@ -518,15 +518,34 @@ pub async fn terminate_negotiation(
     Path(provider_pid): Path<String>,
     Json(_msg): Json<ContractNegotiationTerminationMessage>,
 ) -> impl IntoResponse {
-    let lookup = provider_pid.clone();
-    match state.with_graph(move |g| g.negotiation(&lookup)).await {
-        Ok(Some(n)) if n.state == NegotiationState::Terminated => {
-            return StatusCode::OK.into_response();
-        }
-        Ok(_) => {}
-        Err(e) => return store_error(Some(&provider_pid), None, e),
+    let pid = provider_pid.clone();
+    // The check and the write share one write lock, so a termination racing
+    // another one (a retry, or the Provider's own) still sees TERMINATED.
+    // `Err(None)` means already terminated: nothing to rewrite.
+    let result = state
+        .with_graph(move |g| {
+            g.update_negotiation(&pid, |n| {
+                let from = n.state;
+                if from == NegotiationState::Terminated {
+                    return Err(None);
+                }
+                n.transition(NegotiationState::Terminated)
+                    .map_err(|_| Some((from, n.consumer_pid.clone())))
+            })
+        })
+        .await;
+    match result {
+        Ok(Some(Ok(()) | Err(None))) => StatusCode::OK.into_response(),
+        Ok(Some(Err(Some((from, consumer_pid))))) => bad_transition(
+            &provider_pid,
+            &consumer_pid,
+            from,
+            NegotiationState::Terminated,
+        )
+        .into_response(),
+        Ok(None) => not_found(&provider_pid).into_response(),
+        Err(e) => store_error(Some(&provider_pid), None, e),
     }
-    transition(&state, &provider_pid, NegotiationState::Terminated).await
 }
 
 #[cfg(test)]
