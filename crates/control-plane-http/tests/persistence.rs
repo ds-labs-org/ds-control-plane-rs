@@ -299,3 +299,117 @@ async fn one_unreadable_record_neither_stops_startup_nor_hides_the_catalog() {
         .collect();
     assert_eq!(ids, ["urn:uuid:control-plane-rs-seed-dataset"]);
 }
+
+/// A stand-in Consumer that records the path of every message it receives
+/// and answers 200; returns the record and its callback address.
+async fn recording_consumer() -> (std::sync::Arc<std::sync::Mutex<Vec<String>>>, String) {
+    use axum::extract::{Path, State};
+    use std::sync::{Arc, Mutex};
+    let received: Arc<Mutex<Vec<String>>> = Arc::default();
+    let router = axum::Router::new()
+        .route(
+            "/callback/negotiations/{pid}/{kind}",
+            axum::routing::post(
+                |State(r): State<Arc<Mutex<Vec<String>>>>,
+                 Path((pid, kind)): Path<(String, String)>| async move {
+                    r.lock()
+                        .unwrap()
+                        .push(format!("/negotiations/{pid}/{kind}"));
+                    StatusCode::OK
+                },
+            ),
+        )
+        .with_state(received.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (received, format!("http://{addr}/callback"))
+}
+
+async fn wait_for_state(router: &axum::Router, provider_pid: &str, state: &str) {
+    let mut last = serde_json::Value::Null;
+    for _ in 0..100 {
+        let (_, ack) = call(
+            router,
+            "GET",
+            &format!("/dsp/2025-1/negotiations/{provider_pid}"),
+            None,
+        )
+        .await;
+        if ack["state"] == state {
+            return;
+        }
+        last = ack;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("{provider_pid} never reached {state}; last seen {last}");
+}
+
+/// Negotiations a restart (or a crash) caught between two of the
+/// Provider's own steps are moved on once the app is built again on the
+/// same store: a REQUESTED one is agreed, an AGREED one has its agreement
+/// sent again, and a VERIFIED one is finalized.
+#[tokio::test]
+async fn in_flight_negotiations_are_resumed_after_a_restart() {
+    let (received, callback) = recording_consumer().await;
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let app = control_plane_http::build(config(dir.path(), "http://before.example"))
+            .await
+            .unwrap();
+        let offer = control_plane_core::common::Offer {
+            id: "urn:uuid:control-plane-rs-seed-offer".to_string(),
+            type_: "Offer".to_string(),
+            target: Some("urn:uuid:control-plane-rs-seed-dataset".to_string()),
+            permission: vec![control_plane_core::common::Rule {
+                action: "use".to_string(),
+                constraint: vec![],
+            }],
+            prohibition: vec![],
+            obligation: vec![],
+        };
+        let mut requested = ContractNegotiation::new("urn:uuid:p-req", "urn:uuid:c-req");
+        requested.offer = Some(offer);
+        requested.callback_address = Some(callback.clone());
+        let mut agreed = finalized_negotiation();
+        agreed.provider_pid = "urn:uuid:p-agr".to_string();
+        agreed.consumer_pid = "urn:uuid:c-agr".to_string();
+        agreed.state = NegotiationState::Agreed;
+        agreed.agreement.as_mut().unwrap().id = "urn:uuid:agr-agr".to_string();
+        agreed.callback_address = Some(callback.clone());
+        let mut verified = finalized_negotiation();
+        verified.provider_pid = "urn:uuid:p-ver".to_string();
+        verified.consumer_pid = "urn:uuid:c-ver".to_string();
+        verified.state = NegotiationState::Verified;
+        verified.agreement.as_mut().unwrap().id = "urn:uuid:agr-ver".to_string();
+        verified.callback_address = Some(callback.clone());
+        for n in [&requested, &agreed, &verified] {
+            app.graph.put_negotiation(n).unwrap();
+        }
+        app.graph.flush().unwrap();
+    }
+
+    let app = control_plane_http::build(config(dir.path(), "http://after.example"))
+        .await
+        .unwrap();
+    wait_for_state(&app.router, "urn:uuid:p-req", "AGREED").await;
+    wait_for_state(&app.router, "urn:uuid:p-agr", "AGREED").await;
+    wait_for_state(&app.router, "urn:uuid:p-ver", "FINALIZED").await;
+    for _ in 0..100 {
+        if received.lock().unwrap().len() >= 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let mut paths = received.lock().unwrap().clone();
+    paths.sort();
+    assert_eq!(
+        paths,
+        [
+            "/negotiations/urn:uuid:c-agr/agreement",
+            "/negotiations/urn:uuid:c-req/agreement",
+            "/negotiations/urn:uuid:c-ver/events",
+        ]
+    );
+    assert!(app.graph.agreement("urn:uuid:agr-ver").unwrap().is_some());
+}

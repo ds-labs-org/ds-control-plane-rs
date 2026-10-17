@@ -621,3 +621,53 @@ async fn a_counter_request_after_agreement_is_rejected() {
         "urn:uuid:control-plane-rs-seed-offer"
     );
 }
+
+/// A Consumer retrying its verification (its first reply was lost, or the
+/// Provider stopped before finalizing) is answered 200, and a negotiation
+/// still VERIFIED is finalized then.
+#[tokio::test]
+async fn a_repeated_verification_is_answered_and_finalizes() {
+    use control_plane_core::negotiation::{ContractNegotiation, NegotiationState};
+    let (consumer, callback) = consumer().await;
+    let app = app().await;
+    let (status, ack) = call(
+        &app.router,
+        "POST",
+        "/negotiations/request",
+        Some(request("urn:uuid:c1", Some(&callback))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let agreed_pid = ack["providerPid"].as_str().unwrap().to_string();
+    wait_for_state(&app.router, &agreed_pid, "AGREED").await;
+    wait_for_messages(&consumer, 1).await;
+    // As a restart leaves it: VERIFIED, with finalize never run.
+    let mut stuck: ContractNegotiation = app.graph.negotiation(&agreed_pid).unwrap().unwrap();
+    stuck.state = NegotiationState::Verified;
+    app.graph.put_negotiation(&stuck).unwrap();
+
+    let verification = json!({
+        "@context": ["https://w3id.org/dspace/2025/1/context.jsonld"],
+        "@type": "ContractAgreementVerificationMessage",
+        "providerPid": agreed_pid,
+        "consumerPid": "urn:uuid:c1"
+    });
+    let uri = format!("/negotiations/{agreed_pid}/agreement/verification");
+    let (status, _) = call(&app.router, "POST", &uri, Some(verification.clone())).await;
+    assert_eq!(status, StatusCode::OK);
+    wait_for_state(&app.router, &agreed_pid, "FINALIZED").await;
+    let received = wait_for_messages(&consumer, 2).await;
+    assert_eq!(received[1].0, "/negotiations/urn:uuid:c1/events");
+
+    // Once FINALIZED, the retry is still answered 200, without a change.
+    let (status, _) = call(&app.router, "POST", &uri, Some(verification)).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, ack) = call(
+        &app.router,
+        "GET",
+        &format!("/negotiations/{agreed_pid}"),
+        None,
+    )
+    .await;
+    assert_eq!(ack["state"], "FINALIZED");
+}
