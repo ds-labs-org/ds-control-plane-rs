@@ -4,6 +4,7 @@
 //! agreement it has finalized. A small axum server stands in for the
 //! Consumer and records what it receives.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -28,6 +29,10 @@ struct Consumer {
     /// Agreement but a proxy fails its reply.
     verifies_then_fails: Option<axum::Router>,
     verifications: Arc<Mutex<Vec<(String, StatusCode)>>>,
+    /// Answers 409 to the agreement callback until this is set, as a
+    /// Consumer does that only accepts an Agreement once it has stored
+    /// the ACK of its request (the TCK Consumer is one).
+    ready: Option<Arc<AtomicBool>>,
 }
 
 impl Consumer {
@@ -66,6 +71,11 @@ async fn record(
             .unwrap()
             .push((provider_pid, status));
         return StatusCode::BAD_GATEWAY;
+    }
+    if let (Some(ready), "agreement") = (&consumer.ready, kind.as_str())
+        && !ready.load(Ordering::SeqCst)
+    {
+        return StatusCode::CONFLICT;
     }
     if consumer.fails_agreement && kind == "agreement" {
         StatusCode::INTERNAL_SERVER_ERROR
@@ -315,6 +325,48 @@ async fn a_rejected_agreement_terminates_and_tells_the_consumer() {
     assert_eq!(msg["providerPid"], provider_pid.as_str());
     assert_eq!(msg["consumerPid"], "urn:uuid:c1");
     assert!(msg["code"].is_string());
+}
+
+/// The Agreement can reach the Consumer before it has processed the ACK
+/// of its own request; a Consumer that refuses it until then must get it
+/// again, not lose the negotiation to a silent termination.
+#[tokio::test]
+async fn an_agreement_refused_before_the_consumer_stored_the_ack_is_sent_again() {
+    let ready = Arc::new(AtomicBool::new(false));
+    let (consumer, callback) = serve(Consumer {
+        ready: Some(ready.clone()),
+        ..Consumer::default()
+    })
+    .await;
+    let app = app().await;
+    let (status, ack) = call(
+        &app.router,
+        "POST",
+        "/negotiations/request",
+        Some(request("urn:uuid:c1", Some(&callback))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let provider_pid = ack["providerPid"].as_str().unwrap().to_string();
+    // The Consumer takes a while to store the ACK, e.g. in a transaction.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    ready.store(true, Ordering::SeqCst);
+
+    let received = wait_for_messages(&consumer, 2).await;
+    assert!(
+        received
+            .iter()
+            .all(|(path, _)| path == "/negotiations/urn:uuid:c1/agreement"),
+        "{received:?}"
+    );
+    let (_, ack) = call(
+        &app.router,
+        "GET",
+        &format!("/negotiations/{provider_pid}"),
+        None,
+    )
+    .await;
+    assert_eq!(ack["state"], "AGREED");
 }
 
 /// A Consumer whose verification the Provider answered 200 holds the
