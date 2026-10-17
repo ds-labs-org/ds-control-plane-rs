@@ -351,21 +351,6 @@ pub async fn negotiation_event(
     response
 }
 
-/// `POST {dsp}/negotiations/:providerPid/agreement/verification` — the
-/// Consumer verifies the Agreement, `VERIFIED`; the Provider then
-/// finalizes on its own ([`finalize`]).
-pub async fn verify_agreement(
-    State(state): State<Arc<AppState>>,
-    Path(provider_pid): Path<String>,
-    Json(_msg): Json<ContractAgreementVerificationMessage>,
-) -> impl IntoResponse {
-    let response = transition(&state, &provider_pid, NegotiationState::Verified).await;
-    if response.status() == StatusCode::OK {
-        tokio::spawn(finalize(state.clone(), provider_pid));
-    }
-    response
-}
-
 /// The Provider agrees to the negotiation `provider_pid`'s current offer
 /// (the stub policy agrees to every offer): it stores the Agreement,
 /// moves to `AGREED`, then sends the `ContractAgreementMessage` to the
@@ -411,6 +396,19 @@ pub async fn agree(state: Arc<AppState>, provider_pid: String) {
             return;
         }
     };
+    deliver_agreement(state, provider_pid, consumer_pid, callback, agreement).await;
+}
+
+/// Sends `agreement` to the Consumer; on failure terminates the
+/// negotiation if it is still `AGREED` with that Agreement, and tells the
+/// Consumer so (see [`agree`]).
+async fn deliver_agreement(
+    state: Arc<AppState>,
+    provider_pid: String,
+    consumer_pid: String,
+    callback: String,
+    agreement: control_plane_core::common::Agreement,
+) {
     let agreement_id = agreement.id.clone();
     if let Err(error) = state
         .callbacks
@@ -506,6 +504,90 @@ pub async fn finalize(state: Arc<AppState>, provider_pid: String) {
         .await
     {
         tracing::warn!(%provider_pid, %callback, %error, "could not send the finalized event");
+    }
+}
+
+/// `POST {dsp}/negotiations/:providerPid/agreement/verification` — the
+/// Consumer verifies the Agreement, `VERIFIED`; the Provider then
+/// finalizes on its own ([`finalize`]). A repeated verification (a retry
+/// after a lost reply, or after a restart stopped the Provider before it
+/// finalized) is a 200: one still `VERIFIED` is finalized again, one
+/// already `FINALIZED` is left as it is.
+pub async fn verify_agreement(
+    State(state): State<Arc<AppState>>,
+    Path(provider_pid): Path<String>,
+    Json(_msg): Json<ContractAgreementVerificationMessage>,
+) -> impl IntoResponse {
+    let pid = provider_pid.clone();
+    // `Err(None)`: already verified, nothing to rewrite.
+    let result = state
+        .with_graph(move |g| {
+            g.update_negotiation(&pid, |n| {
+                let from = n.state;
+                if matches!(
+                    from,
+                    NegotiationState::Verified | NegotiationState::Finalized
+                ) {
+                    return Err(None);
+                }
+                n.transition(NegotiationState::Verified)
+                    .map_err(|_| Some((from, n.consumer_pid.clone())))
+            })
+        })
+        .await;
+    match result {
+        Ok(Some(Ok(()) | Err(None))) => {
+            // finalize() leaves a FINALIZED negotiation as it is.
+            tokio::spawn(finalize(state.clone(), provider_pid));
+            StatusCode::OK.into_response()
+        }
+        Ok(Some(Err(Some((from, consumer_pid))))) => bad_transition(
+            &provider_pid,
+            &consumer_pid,
+            from,
+            NegotiationState::Verified,
+        )
+        .into_response(),
+        Ok(None) => not_found(&provider_pid).into_response(),
+        Err(e) => store_error(Some(&provider_pid), None, e),
+    }
+}
+
+/// Resumes the Provider's own steps that a restart, a crash or a store
+/// error left undone: agrees to `REQUESTED` or `ACCEPTED` negotiations
+/// that have a `callbackAddress`, sends an `AGREED` negotiation's
+/// Agreement again (terminating it if that fails, as [`agree`] does), and
+/// finalizes `VERIFIED` ones. [`crate::build`] runs it at startup; an
+/// unreadable negotiation is skipped, and a store error is logged rather
+/// than stopping startup. The steps themselves run as spawned tasks.
+pub async fn resume(state: &Arc<AppState>) {
+    let negotiations = match state.with_graph(|g| g.negotiations()).await {
+        Ok(negotiations) => negotiations,
+        Err(error) => {
+            tracing::error!(%error, "could not list negotiations to resume");
+            return;
+        }
+    };
+    for n in negotiations.into_iter().map(|r| r.value) {
+        let pid = n.provider_pid;
+        match (n.state, n.callback_address, n.agreement) {
+            (NegotiationState::Requested | NegotiationState::Accepted, Some(_), _) => {
+                tokio::spawn(agree(state.clone(), pid));
+            }
+            (NegotiationState::Agreed, Some(callback), Some(agreement)) => {
+                tokio::spawn(deliver_agreement(
+                    state.clone(),
+                    pid,
+                    n.consumer_pid,
+                    callback,
+                    agreement,
+                ));
+            }
+            (NegotiationState::Verified, _, _) => {
+                tokio::spawn(finalize(state.clone(), pid));
+            }
+            _ => {}
+        }
     }
 }
 

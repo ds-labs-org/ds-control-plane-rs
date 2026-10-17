@@ -101,7 +101,13 @@ side of a connector.
   `.../:consumerPid/termination` (the Consumer may have stored the
   Agreement despite the failure, e.g. after a timeout); a later Consumer
   termination of it is a 200, not an error. Without a
-  `callbackAddress` the negotiation stays `REQUESTED`. Callbacks
+  `callbackAddress` the negotiation stays `REQUESTED`. A Consumer may
+  repeat its verification: the reply is a 200, and a negotiation still
+  `VERIFIED` is finalized then. At startup the Provider resumes its own
+  steps that a restart or a crash cut short (`negotiation::resume`): it
+  agrees to `REQUESTED`/`ACCEPTED` negotiations with a `callbackAddress`,
+  sends an `AGREED` negotiation's Agreement again (terminating as above
+  if that fails), and finalizes `VERIFIED` ones. Callbacks
   (`crates/control-plane-http/src/callback.rs`) never follow redirects and
   give up after 10 s; since the Consumer is not authenticated yet, the
   callback address is whatever the requester sent.
@@ -229,7 +235,8 @@ and its new data services are written in one transaction.
 `GraphConfig` reads) to a directory and the store is RocksDB-backed:
 the catalog, negotiations and transfer processes survive a restart
 (`crates/control-plane-http/tests/persistence.rs` drives the real router,
-restarts on the same directory and reads everything back). Unset, the
+restarts on the same directory and reads everything back, including
+negotiations a restart caught in flight, which are resumed). Unset, the
 store is in memory as before. RocksDB is oxigraph's `rocksdb` feature,
 a from-source C++ build, on by default through `control-plane-graph`'s
 own `rocksdb` feature. Only one process can hold a store directory open:
