@@ -4,7 +4,7 @@
 //! (`/:callback/negotiations/...`) are out of scope for this pass — see
 //! `../../../ARCHITECTURE.md`.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use axum::Json;
@@ -274,7 +274,10 @@ pub async fn initiate_negotiation(
     match state.with_graph(move |g| g.put_negotiation(&stored)).await {
         Ok(()) => {
             if negotiation.callback_address.is_some() {
-                tokio::spawn(agree(state.clone(), negotiation.provider_pid.clone()));
+                tokio::spawn(agree(
+                    Arc::downgrade(&state),
+                    negotiation.provider_pid.clone(),
+                ));
             }
             (StatusCode::CREATED, Json(negotiation.to_ack())).into_response()
         }
@@ -361,7 +364,7 @@ pub async fn negotiation_event(
     }
     let response = transition(&state, &provider_pid, NegotiationState::Accepted).await;
     if response.status() == StatusCode::OK {
-        tokio::spawn(agree(state.clone(), provider_pid));
+        tokio::spawn(agree(Arc::downgrade(&state), provider_pid));
     }
     response
 }
@@ -376,29 +379,37 @@ pub async fn negotiation_event(
 /// sends it a best-effort `ContractNegotiationTerminationMessage` -- unless
 /// the negotiation has left `AGREED` meanwhile (a verification proves the
 /// Consumer got the Agreement despite the failed reply).
-pub async fn agree(state: Arc<AppState>, provider_pid: String) {
-    let assigner = state.config.agent_id.clone();
+///
+/// It runs as a background task holding only a [`Weak`] handle on the app,
+/// so dropping the app releases the store at once; the task then stops at
+/// its next store access.
+pub async fn agree(state: Weak<AppState>, provider_pid: String) {
+    let Some(assigner) = state.upgrade().map(|s| s.config.agent_id.clone()) else {
+        return;
+    };
     let pid = provider_pid.clone();
-    let agreed = state
-        .with_graph(move |g| {
-            g.update_negotiation(&pid, |n| {
-                let callback = n
-                    .callback_address
-                    .clone()
-                    .ok_or_else(|| "no callbackAddress to send the agreement to".to_string())?;
-                // Without DCP the Consumer has no verified participant id
-                // yet; its consumerPid is the only name this Provider has
-                // for it.
-                let assignee = n.consumer_pid.clone();
-                let id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
-                let agreement = n
-                    .agree(id, assigner, assignee, chrono::Utc::now())
-                    .map_err(|e| e.to_string())?
-                    .clone();
-                Ok::<_, String>((agreement, n.consumer_pid.clone(), callback))
-            })
+    let agreed = AppState::with_graph_of(&state, move |g| {
+        g.update_negotiation(&pid, |n| {
+            let callback = n
+                .callback_address
+                .clone()
+                .ok_or_else(|| "no callbackAddress to send the agreement to".to_string())?;
+            // Without DCP the Consumer has no verified participant id
+            // yet; its consumerPid is the only name this Provider has
+            // for it.
+            let assignee = n.consumer_pid.clone();
+            let id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
+            let agreement = n
+                .agree(id, assigner, assignee, chrono::Utc::now())
+                .map_err(|e| e.to_string())?
+                .clone();
+            Ok::<_, String>((agreement, n.consumer_pid.clone(), callback))
         })
-        .await;
+    })
+    .await;
+    let Some(agreed) = agreed else {
+        return;
+    };
     let (agreement, consumer_pid, callback) = match agreed {
         Ok(Some(Ok(agreed))) => agreed,
         Ok(Some(Err(reason))) => {
@@ -426,14 +437,17 @@ pub const AGREEMENT_RETRY_DELAYS: [Duration; 3] = [
 
 /// Whether the negotiation `provider_pid` is still `AGREED` with the
 /// Agreement `agreement_id`, i.e. still waiting for the Consumer to take it.
-async fn awaiting_agreement(state: &AppState, provider_pid: &str, agreement_id: &str) -> bool {
+/// `false` once the app is dropped.
+async fn awaiting_agreement(
+    state: &Weak<AppState>,
+    provider_pid: &str,
+    agreement_id: &str,
+) -> bool {
     let pid = provider_pid.to_string();
     let id = agreement_id.to_string();
     matches!(
-        state
-            .with_graph(move |g| g.negotiation(&pid))
-            .await,
-        Ok(Some(n)) if n.state == NegotiationState::Agreed
+        AppState::with_graph_of(state, move |g| g.negotiation(&pid)).await,
+        Some(Ok(Some(n))) if n.state == NegotiationState::Agreed
             && n.agreement.as_ref().map(|a| &a.id) == Some(&id)
     )
 }
@@ -444,17 +458,21 @@ async fn awaiting_agreement(state: &AppState, provider_pid: &str, agreement_id: 
 /// negotiation if it is still `AGREED` with that Agreement, and tells the
 /// Consumer so (see [`agree`]).
 async fn deliver_agreement(
-    state: Arc<AppState>,
+    state: Weak<AppState>,
     provider_pid: String,
     consumer_pid: String,
     callback: String,
     agreement: control_plane_core::common::Agreement,
 ) {
+    // A clone, so that no strong handle on the app is held while waiting
+    // on the Consumer.
+    let Some(callbacks) = state.upgrade().map(|s| s.callbacks.clone()) else {
+        return;
+    };
     let agreement_id = agreement.id.clone();
     let mut delays = AGREEMENT_RETRY_DELAYS.iter();
     let sent = loop {
-        let sent = state
-            .callbacks
+        let sent = callbacks
             .send_agreement(&callback, &provider_pid, &consumer_pid, agreement.clone())
             .await;
         let retryable = !matches!(sent, Ok(()) | Err(CallbackError::Unusable(_)));
@@ -474,19 +492,21 @@ async fn deliver_agreement(
         let pid = provider_pid.clone();
         // Terminate only the negotiation as this call left it: a Consumer
         // that has verified meanwhile holds the Agreement after all.
-        let terminated = state
-            .with_graph(move |g| {
-                g.update_negotiation(&pid, |n| {
-                    let unanswered = n.state == NegotiationState::Agreed
-                        && n.agreement.as_ref().map(|a| &a.id) == Some(&agreement_id);
-                    if unanswered {
-                        n.transition(NegotiationState::Terminated).map(|()| true)
-                    } else {
-                        Ok(false)
-                    }
-                })
+        let terminated = AppState::with_graph_of(&state, move |g| {
+            g.update_negotiation(&pid, |n| {
+                let unanswered = n.state == NegotiationState::Agreed
+                    && n.agreement.as_ref().map(|a| &a.id) == Some(&agreement_id);
+                if unanswered {
+                    n.transition(NegotiationState::Terminated).map(|()| true)
+                } else {
+                    Ok(false)
+                }
             })
-            .await;
+        })
+        .await;
+        let Some(terminated) = terminated else {
+            return;
+        };
         match terminated {
             Ok(Some(Ok(true))) => {}
             Ok(Some(Ok(false))) => {
@@ -505,8 +525,7 @@ async fn deliver_agreement(
         }
         // Best effort: the Consumer may have stored the Agreement anyway
         // (a lost response, a timeout), so tell it the negotiation is over.
-        if let Err(error) = state
-            .callbacks
+        if let Err(error) = callbacks
             .send_terminated(
                 &callback,
                 &provider_pid,
@@ -525,18 +544,23 @@ async fn deliver_agreement(
 /// `FINALIZED`, which is what makes its Agreement grant transfers, then
 /// the `FINALIZED` event to the Consumer. The Consumer has already
 /// verified, so a failed delivery is logged and the negotiation stays
-/// finalized.
-pub async fn finalize(state: Arc<AppState>, provider_pid: String) {
+/// finalized. Like [`agree`], it holds only a [`Weak`] handle on the app.
+pub async fn finalize(state: Weak<AppState>, provider_pid: String) {
+    let Some(callbacks) = state.upgrade().map(|s| s.callbacks.clone()) else {
+        return;
+    };
     let pid = provider_pid.clone();
-    let finalized = state
-        .with_graph(move |g| {
-            g.update_negotiation(&pid, |n| {
-                n.transition(NegotiationState::Finalized)
-                    .map_err(|e| e.to_string())?;
-                Ok::<_, String>((n.consumer_pid.clone(), n.callback_address.clone()))
-            })
+    let finalized = AppState::with_graph_of(&state, move |g| {
+        g.update_negotiation(&pid, |n| {
+            n.transition(NegotiationState::Finalized)
+                .map_err(|e| e.to_string())?;
+            Ok::<_, String>((n.consumer_pid.clone(), n.callback_address.clone()))
         })
-        .await;
+    })
+    .await;
+    let Some(finalized) = finalized else {
+        return;
+    };
     let (consumer_pid, callback) = match finalized {
         Ok(Some(Ok(finalized))) => finalized,
         Ok(Some(Err(reason))) => {
@@ -553,8 +577,7 @@ pub async fn finalize(state: Arc<AppState>, provider_pid: String) {
         tracing::warn!(%provider_pid, "finalized, but no callbackAddress to tell the consumer");
         return;
     };
-    if let Err(error) = state
-        .callbacks
+    if let Err(error) = callbacks
         .send_finalized(&callback, &provider_pid, &consumer_pid)
         .await
     {
@@ -593,7 +616,7 @@ pub async fn verify_agreement(
     match result {
         Ok(Some(Ok(()) | Err(None))) => {
             // finalize() leaves a FINALIZED negotiation as it is.
-            tokio::spawn(finalize(state.clone(), provider_pid));
+            tokio::spawn(finalize(Arc::downgrade(&state), provider_pid));
             StatusCode::OK.into_response()
         }
         Ok(Some(Err(Some((from, consumer_pid))))) => bad_transition(
@@ -627,11 +650,11 @@ pub async fn resume(state: &Arc<AppState>) {
         let pid = n.provider_pid;
         match (n.state, n.callback_address, n.agreement) {
             (NegotiationState::Requested | NegotiationState::Accepted, Some(_), _) => {
-                tokio::spawn(agree(state.clone(), pid));
+                tokio::spawn(agree(Arc::downgrade(state), pid));
             }
             (NegotiationState::Agreed, Some(callback), Some(agreement)) => {
                 tokio::spawn(deliver_agreement(
-                    state.clone(),
+                    Arc::downgrade(state),
                     pid,
                     n.consumer_pid,
                     callback,
@@ -639,7 +662,7 @@ pub async fn resume(state: &Arc<AppState>) {
                 ));
             }
             (NegotiationState::Verified, _, _) => {
-                tokio::spawn(finalize(state.clone(), pid));
+                tokio::spawn(finalize(Arc::downgrade(state), pid));
             }
             _ => {}
         }
