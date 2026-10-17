@@ -80,13 +80,16 @@ const EXPECTED_FAILURES: &[&str] = &[
     // every request and finalizes once the consumer verifies (see
     // ../../../ARCHITECTURE.md, "Negotiation progression"), so the
     // scenarios built on that path pass (`CN:01-04`, `CN:02-02`,
-    // `CN:02-03`, `CN:03-01`). These remaining ones need the provider to
-    // send a counter-offer first or to terminate on its own, which a
+    // `CN:02-03`, `CN:03-01`). `CN:02-01` passes too, though not by
+    // policy: the TCK consumer refuses the Agreement (404), so after its
+    // retries the provider terminates and sends a
+    // `ContractNegotiationTerminationMessage`, which is what the scenario
+    // expects. These remaining ones need the provider to send a
+    // counter-offer first or to terminate on its own by policy, which a
     // provider that always agrees never does.
     "CN:01-01",
     "CN:01-02",
     "CN:01-03",
-    "CN:02-01",
     "CN:02-04",
     "CN:02-05",
     "CN:02-06",

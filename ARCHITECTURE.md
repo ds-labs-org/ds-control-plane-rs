@@ -333,14 +333,16 @@ executed.
   for the full, commented list and why each entry fails.
 
 **Result: 65 tests run, 12 passed, 53 failed — exactly the documented set.**
-(Re-run on 2026-10-16 after the provider started agreeing and finalizing
-on its own; the 2026-09-19 run had 8 passed, with only `CN:02-02` in `CN`.)
+(Re-run on 2026-10-17 after the provider started retrying an undelivered
+Agreement and telling the Consumer when it then terminates, which made
+`CN:02-01` pass; the 2026-10-16 run had 11 passed, and the 2026-09-19 run
+8, with only `CN:02-02` in `CN`.)
 
 | Group | Total | Passed | Failed | Notes |
 |-------|------:|-------:|-------:|-------|
 | `MET` | 1 | 1 | 0 | Full pass, as expected — the metadata endpoint is fully implemented. |
 | `CAT` | 3 | 3 | 0 | Full pass. `CAT:01-01`/`CAT:01-02` needed `dsp.tck.properties`'s `CAT_01_01_DATASETID`/`CAT_01_02_DATASETID` overrides pointed at this bootstrap's one real seed dataset id (the TCK's own documented mechanism for this — see its README, "Catalog protocol"); `CAT:01-03` (not-found) passes with the TCK's own random default id. |
-| `CN` (provider) | 15 | 4 | 11 | `CN:01-04`, `CN:02-03` and `CN:03-01` follow the agree, verify, finalize path; `CN:02-02` passes because terminating an already terminated negotiation succeeds. The other 11 need the provider to counter-offer first or to terminate on its own, which an always-agree provider never does. |
+| `CN` (provider) | 15 | 5 | 10 | `CN:01-04`, `CN:02-03` and `CN:03-01` follow the agree, verify, finalize path; `CN:02-02` passes because terminating an already terminated negotiation succeeds. `CN:02-01` passes only incidentally: the TCK consumer refuses the Agreement, so after its retries the provider terminates and sends a `ContractNegotiationTerminationMessage` — not a policy decision to terminate. The other 10 need the provider to counter-offer first or to terminate on its own by policy, which an always-agree provider never does. |
 | `CN_C` (consumer) | 16 | 0 | 16 | Out of scope: no consumer-role HTTP surface at all. |
 | `TP` (provider) | 15 | 3 | 12 | `TP:03-01`, `TP:03-02` (reactive negative scenarios) and `TP:02-05` (a reactive termination) pass; the rest require the provider to spontaneously push a `TransferStartMessage`, which this bootstrap never does. Every `TP` test sends `TP_NN_NN_AGREEMENTID` from `dsp.tck.properties`, an agreement `tests/dsp_tck.rs` stores as finalized before the run. |
 | `TP_C` (consumer) | 15 | 0 | 15 | Out of scope: no consumer-role HTTP surface at all. |
