@@ -416,6 +416,34 @@ async fn an_offer_with_terms_the_provider_cannot_hold_is_refused_not_weakened() 
     assert_eq!(status, StatusCode::CREATED);
 }
 
+/// The DSP Offer and Agreement schemas require a permission or a
+/// prohibition: an offer with neither (no rules, or only an obligation) is
+/// refused, so the Provider never sends a schema-invalid Agreement.
+#[tokio::test]
+async fn an_offer_without_a_permission_or_prohibition_is_refused() {
+    let (consumer, callback) = consumer().await;
+    let app = app().await;
+    for rules in [json!({}), json!({"obligation": [{"action": "compensate"}]})] {
+        let mut msg = request("urn:uuid:c1", Some(&callback));
+        let offer = msg["offer"].as_object_mut().unwrap();
+        offer.remove("permission");
+        for (k, v) in rules.as_object().unwrap() {
+            offer.insert(k.clone(), v.clone());
+        }
+        let (status, error) = call(&app.router, "POST", "/negotiations/request", Some(msg)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{rules} was accepted");
+        assert_eq!(error["@type"], "ContractNegotiationError");
+        assert_eq!(error["consumerPid"], "urn:uuid:c1");
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        consumer.received().is_empty(),
+        "an agreement was sent: {:?}",
+        consumer.received()
+    );
+    assert!(app.graph.negotiations().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn without_a_callback_address_the_negotiation_waits() {
     let app = app().await;

@@ -467,6 +467,23 @@ mod tests {
     }
 
     #[test]
+    fn agreeing_to_an_offer_without_a_permission_or_prohibition_fails() {
+        let mut n = requested_with_offer();
+        let offer = n.offer.as_mut().unwrap();
+        offer.permission.clear();
+        offer.obligation = vec![crate::common::Rule {
+            action: "compensate".to_string(),
+            constraint: vec![],
+        }];
+        assert!(matches!(
+            n.agree("urn:uuid:a", "urn:p", "urn:c", chrono::Utc::now()),
+            Err(NegotiationError::NoRules)
+        ));
+        assert_eq!(n.state, NegotiationState::Requested);
+        assert!(n.agreement.is_none());
+    }
+
+    #[test]
     fn agreeing_without_an_offer_or_from_a_late_state_changes_nothing() {
         let mut n = ContractNegotiation::new("p1", "c1");
         assert!(matches!(
