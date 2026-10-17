@@ -542,6 +542,37 @@ async fn terminating_an_already_terminated_negotiation_succeeds() {
     assert_eq!(ack["state"], "TERMINATED");
 }
 
+/// Two terminations racing each other (a retry, or the Consumer and the
+/// Provider's own termination of an undeliverable agreement) both succeed:
+/// the already-TERMINATED check and the write happen under one lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_terminations_all_succeed() {
+    let app = app().await;
+    for i in 0..100 {
+        let (_, ack) = call(
+            &app.router,
+            "POST",
+            "/negotiations/request",
+            Some(request(&format!("urn:uuid:c{i}"), None)),
+        )
+        .await;
+        let provider_pid = ack["providerPid"].as_str().unwrap().to_string();
+        let uri = format!("/negotiations/{provider_pid}/termination");
+        let sends: Vec<_> = (0..2)
+            .map(|_| {
+                let router = app.router.clone();
+                let uri = uri.clone();
+                let body = termination(&provider_pid);
+                tokio::spawn(async move { call(&router, "POST", &uri, Some(body)).await })
+            })
+            .collect();
+        for send in sends {
+            let (status, err) = send.await.unwrap();
+            assert_eq!(status, StatusCode::OK, "negotiation {provider_pid}: {err}");
+        }
+    }
+}
+
 /// A finalized negotiation stays final: terminating it is still an error.
 #[tokio::test]
 async fn terminating_a_finalized_negotiation_is_still_rejected() {
