@@ -114,7 +114,10 @@ side of a connector.
   `duty`, `remedy` or `consequence`, a policy `profile`, a constraint's
   `unit`, `rightOperandReference`, `dataType` or `status`) are refused
   with a 400 `ContractNegotiationError` rather than agreed without them. It never counter-offers and never terminates on its
-  own except when an agreement cannot be delivered.
+  own except when an agreement cannot be delivered. Since it never sends
+  an Offer, a Consumer counter-request (`POST
+  /negotiations/:providerPid/request`) is refused with a 400
+  `ContractNegotiationError`: the spec allows one only from `OFFERED`.
 - **Agreement assignee**: there is no DCP yet, so the Consumer has no
   verified participant id; the Agreement's `assignee` is its
   `consumerPid`.

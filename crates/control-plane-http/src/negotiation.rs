@@ -272,10 +272,11 @@ pub async fn initiate_negotiation(
 }
 
 /// `POST {dsp}/negotiations/:providerPid/request` — a Consumer counter-offer
-/// against an existing negotiation. This bootstrap records the new offer
-/// but does not itself decide to move to `OFFERED`/`AGREED` — see
-/// `../../../ARCHITECTURE.md` for why real auto-negotiation logic is out of
-/// scope for this pass.
+/// against an existing negotiation. Per the spec a Consumer may counter
+/// only a Provider Offer (`OFFERED` -> `REQUESTED`); in any other state the
+/// request is a 400 and the stored offer, which an Agreement may already
+/// be built from, is left alone. This Provider never sends an Offer, so in
+/// practice every counter-request is refused.
 pub async fn continue_negotiation(
     State(state): State<Arc<AppState>>,
     Path(provider_pid): Path<String>,
@@ -292,13 +293,26 @@ pub async fn continue_negotiation(
     let result = state
         .with_graph(move |g| {
             g.update_negotiation(&pid, |n| {
+                let from = n.state;
+                n.transition(NegotiationState::Requested)
+                    .map_err(|_| (from, n.consumer_pid.clone()))?;
+                if msg.offer.target.is_some() {
+                    n.dataset_id = msg.offer.target.clone();
+                }
                 n.offer = Some(msg.offer);
-                Ok::<(), ()>(())
+                Ok(())
             })
         })
         .await;
     match result {
-        Ok(Some(_)) => StatusCode::OK.into_response(),
+        Ok(Some(Ok(()))) => StatusCode::OK.into_response(),
+        Ok(Some(Err((from, consumer_pid)))) => bad_transition(
+            &provider_pid,
+            &consumer_pid,
+            from,
+            NegotiationState::Requested,
+        )
+        .into_response(),
         Ok(None) => not_found(&provider_pid).into_response(),
         Err(e) => store_error(Some(&provider_pid), None, e),
     }
