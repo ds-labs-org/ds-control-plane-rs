@@ -23,6 +23,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { workspace = true }
 chrono = { workspace = true }
 anyhow = { workspace = true }
+# Sends the Provider's own negotiation messages to the Consumer's
+# callbackAddress (src/callback.rs).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]
 tempfile = "3"
@@ -43,4 +46,3 @@ testcontainers = "0.26"
 # has to be watched for failure lines instead (see tests/dsp_tck.rs).
 futures = "0.3"
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

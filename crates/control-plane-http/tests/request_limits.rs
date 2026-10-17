@@ -40,7 +40,6 @@ fn request(rules: serde_json::Value) -> String {
             "target": "urn:uuid:control-plane-rs-seed-dataset",
             "permission": rules,
         },
-        "callbackAddress": "http://consumer.example/callback",
     })
     .to_string()
 }

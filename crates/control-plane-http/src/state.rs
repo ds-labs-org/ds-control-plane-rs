@@ -3,12 +3,13 @@
 //! transfer-process records, keyed by `providerPid` since this bootstrap
 //! only ever plays the Provider role.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use control_plane_core::catalog::{Catalog, DataService, Dataset, Distribution};
 use control_plane_core::common::{Offer, Rule};
 use control_plane_graph::{ConnectorSettings, ControlPlaneGraph, GraphError};
 
+use crate::callback::Callbacks;
 use crate::config::Config;
 
 /// The dataset id the catalog is seeded with when the settings graph holds
@@ -27,6 +28,8 @@ pub struct AppState {
     /// settings graph.
     pub settings: ConnectorSettings,
     pub graph: Arc<ControlPlaneGraph>,
+    /// Sends this Provider's messages to Consumers' callback addresses.
+    pub callbacks: Callbacks,
 }
 
 impl AppState {
@@ -58,6 +61,7 @@ impl AppState {
             config,
             settings,
             graph: Arc::new(graph),
+            callbacks: Callbacks::new(),
         })
     }
 
@@ -83,6 +87,19 @@ impl AppState {
             Ok(r) => r,
             Err(e) => std::panic::resume_unwind(e.into_panic()),
         }
+    }
+
+    /// [`Self::with_graph`] for a background task, which holds only a
+    /// [`Weak`] handle so that it never keeps the store open (and RocksDB's
+    /// exclusive lock held) after the app is dropped, e.g. while it waits
+    /// up to [`crate::callback::TIMEOUT`] on a Consumer. `None` once the
+    /// app is gone.
+    pub async fn with_graph_of<R: Send + 'static>(
+        state: &Weak<Self>,
+        f: impl FnOnce(&ControlPlaneGraph) -> R + Send + 'static,
+    ) -> Option<R> {
+        let state = state.upgrade()?;
+        Some(state.with_graph(f).await)
     }
 
     /// The catalog, built from the datasets in the settings graph.

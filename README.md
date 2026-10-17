@@ -37,14 +37,16 @@ a real, date-stamped Eclipse Dataspace TCK conformance snapshot.
   (`negotiations/request`, `.../request`, `.../events`,
   `.../agreement/verification`, `.../termination`) and a
   `ContractNegotiation` state machine matching the spec's state
-  descriptions. No automatic agreement/finalization logic — advancing a
-  negotiation past `REQUESTED` currently requires an external actor driving
-  the same HTTP surface a real counter-party would.
+  descriptions. Given a `callbackAddress`, the provider agrees to the
+  request on its own, sends the Agreement, and finalizes once the
+  consumer verifies.
 - **Transfer process**: the full Provider-role HTTP surface (`transfers/request`,
   `.../start`, `.../completion`, `.../termination`, `.../suspension`) and a
   `TransferProcess` state machine matching the spec's state descriptions.
-  No cross-check against a real Agreement store, no data plane wiring.
-- **Policy**: an always-allow stub — no ODRL constraint evaluation.
+  A transfer needs an agreement this connector has finalized. No data
+  plane wiring.
+- **Policy**: an always-allow stub — the provider agrees to every offer,
+  with no ODRL constraint evaluation.
 - **Consumer role**: out of scope for this pass (no consumer HTTP surface,
   no outbound negotiation/transfer initiation).
 

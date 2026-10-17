@@ -78,9 +78,10 @@ pub async fn get_transfer(
     }
 }
 
-/// `POST {dsp}/transfers/request` — always accepted by this bootstrap's
-/// always-allow stub policy (no cross-check against a real Agreement store
-/// yet — see `../../../ARCHITECTURE.md`).
+/// `POST {dsp}/transfers/request` — accepted only under an `agreementId`
+/// this connector has finalized a negotiation for
+/// ([`ControlPlaneGraph::agreement`](control_plane_graph::ControlPlaneGraph::agreement));
+/// any other is a `TransferError` 400.
 pub async fn initiate_transfer(
     State(state): State<Arc<AppState>>,
     Json(msg): Json<TransferRequestMessage>,
@@ -93,8 +94,27 @@ pub async fn initiate_transfer(
         msg.format,
     );
     let stored = transfer.clone();
-    match state.with_graph(move |g| g.put_transfer(&stored)).await {
-        Ok(()) => (StatusCode::CREATED, Json(transfer.to_ack())).into_response(),
+    let result = state
+        .with_graph(move |g| match g.agreement(&stored.agreement_id)? {
+            Some(_) => g.put_transfer(&stored).map(|()| true),
+            None => Ok(false),
+        })
+        .await;
+    match result {
+        Ok(true) => (StatusCode::CREATED, Json(transfer.to_ack())).into_response(),
+        Ok(false) => (
+            StatusCode::BAD_REQUEST,
+            Json(TransferErrorMessage::new(
+                Some(transfer.provider_pid.clone()),
+                Some(transfer.consumer_pid.clone()),
+                "400",
+                format!(
+                    "no finalized contract agreement '{}'",
+                    transfer.agreement_id
+                ),
+            )),
+        )
+            .into_response(),
         Err(e) => store_error(
             Some(&transfer.provider_pid),
             Some(&transfer.consumer_pid),

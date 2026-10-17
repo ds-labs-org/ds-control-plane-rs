@@ -6,8 +6,9 @@
 //! ## Scope: what this actually proves, and what it doesn't
 //!
 //! This control plane is a bootstrap, Provider role only, with an
-//! always-allow stub policy and no automatic negotiation/transfer
-//! progression logic (see `../../../ARCHITECTURE.md`, "Scope"). The DSP
+//! always-allow stub policy: its provider agrees to every request and
+//! finalizes once verified, but never counter-offers and never starts a
+//! transfer on its own (see `../../../ARCHITECTURE.md`, "Scope"). The DSP
 //! TCK's own config-driven filtering
 //! (`dsp.tck.properties`'s `dataspacetck.test.package`) selects whole
 //! verification packages, not individual test classes — `CN`/`CN_C` share
@@ -49,6 +50,8 @@ use std::path::{self, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
+use control_plane_core::common::Agreement;
+use control_plane_core::negotiation::{ContractNegotiation, NegotiationState};
 use control_plane_http::config::Config;
 use futures::FutureExt;
 use futures::future::BoxFuture;
@@ -73,29 +76,29 @@ const SERVER_PORT: u16 = 28080;
 /// (rather than "no failures") buys, and `dsp.tck.properties` for why the
 /// TCK's own filters can't exclude the Consumer-role tests outright.
 const EXPECTED_FAILURES: &[&str] = &[
-    // Contract negotiation, provider role (`CN`) and consumer role
-    // (`CN_C`): every one of these requires this control plane to
-    // *spontaneously* push a negotiation-advancing message (an Offer, an
-    // Agreement, a finalized/accepted event, or a termination) on its own
-    // initiative — this bootstrap's provider never acts, it only reacts to
-    // inbound requests against the Provider HTTP surface (see
-    // ../../../ARCHITECTURE.md, "Stubbed" — negotiation progression).
-    // `CN_C` additionally requires a whole consumer-role HTTP surface this
-    // bootstrap does not implement at all.
+    // Contract negotiation, provider role (`CN`): this provider agrees to
+    // every request and finalizes once the consumer verifies (see
+    // ../../../ARCHITECTURE.md, "Negotiation progression"), so the
+    // scenarios built on that path pass (`CN:01-04`, `CN:02-02`,
+    // `CN:02-03`, `CN:03-01`). `CN:02-01` passes too, though not by
+    // policy: the TCK consumer refuses the Agreement (404), so after its
+    // retries the provider terminates and sends a
+    // `ContractNegotiationTerminationMessage`, which is what the scenario
+    // expects. These remaining ones need the provider to send a
+    // counter-offer first or to terminate on its own by policy, which a
+    // provider that always agrees never does.
     "CN:01-01",
     "CN:01-02",
     "CN:01-03",
-    "CN:01-04",
-    "CN:02-01",
-    "CN:02-03",
     "CN:02-04",
     "CN:02-05",
     "CN:02-06",
     "CN:02-07",
-    "CN:03-01",
     "CN:03-02",
     "CN:03-03",
     "CN:03-04",
+    // Contract negotiation, consumer role (`CN_C`): needs a whole
+    // consumer-role HTTP surface this bootstrap does not implement.
     "CN_C:01-01",
     "CN_C:01-02",
     "CN_C:01-03",
@@ -146,6 +149,30 @@ const EXPECTED_FAILURES: &[&str] = &[
     "TP_C:03-06",
 ];
 
+/// Must match every `TP_NN_NN_AGREEMENTID` in dsp.tck.properties.
+const TCK_AGREEMENT_ID: &str = "urn:uuid:control-plane-rs-tck-agreement";
+
+/// A finalized negotiation holding [`TCK_AGREEMENT_ID`].
+fn tck_agreement_negotiation() -> ContractNegotiation {
+    let mut n = ContractNegotiation::new(
+        "urn:uuid:control-plane-rs-tck-negotiation",
+        "urn:uuid:control-plane-rs-tck-consumer",
+    );
+    n.state = NegotiationState::Finalized;
+    n.agreement = Some(Agreement {
+        id: TCK_AGREEMENT_ID.to_string(),
+        type_: "Agreement".to_string(),
+        target: control_plane_http::state::SEED_DATASET_ID.to_string(),
+        timestamp: chrono::Utc::now(),
+        assigner: "urn:connector:ds-control-plane-rs".to_string(),
+        assignee: "urn:uuid:control-plane-rs-tck-consumer".to_string(),
+        permission: vec![],
+        prohibition: vec![],
+        obligation: vec![],
+    });
+    n
+}
+
 fn properties_path() -> PathBuf {
     PathBuf::from(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -173,6 +200,12 @@ async fn dsp_tck_matches_documented_bootstrap_scope() {
     let app = control_plane_http::build(config)
         .await
         .expect("failed to build the control plane app");
+    // The `TP` tests open transfers under `TP_NN_NN_AGREEMENTID` from
+    // dsp.tck.properties, and a transfer needs an agreement this connector
+    // has finalized, so one is stored before the run.
+    app.graph
+        .put_negotiation(&tck_agreement_negotiation())
+        .expect("failed to store the TCK agreement");
     tokio::spawn(async move {
         let _ = control_plane_http::serve(app).await;
     });

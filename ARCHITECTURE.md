@@ -82,20 +82,59 @@ side of a connector.
   (`crates/control-plane-http/src/transfer.rs`): all six Provider path
   bindings (`GET .../:providerPid`, `POST .../request`, `.../start`,
   `.../completion`, `.../termination`, `.../suspension`), same real
-  state-machine-plus-error-body treatment.
+  state-machine-plus-error-body treatment. `POST .../transfers/request`
+  is a 400 `TransferError` unless its `agreementId` names an agreement
+  this connector has finalized (see "Negotiation progression").
+- **Negotiation progression** (2026-10-16): the Provider moves a
+  negotiation on by itself. After a `ContractRequestMessage` that carries
+  a `callbackAddress`, it builds an `Agreement` from the offer (its rules,
+  its `target`, this connector's `agent_id` as assigner), stores it,
+  moves to `AGREED` and only then sends the `ContractAgreementMessage` to
+  `{callbackAddress}/negotiations/:consumerPid/agreement` (the pid
+  percent-encoded as one segment; a request whose `callbackAddress` is not
+  a plain `http(s)` URL without query or fragment, or whose `consumerPid`
+  is `.` or `..`, is a 400). A consumer
+  `ACCEPTED` event does the same. After the Consumer's verification it
+  moves to `FINALIZED` and sends the `FINALIZED` event to
+  `.../:consumerPid/events`. An agreement grants transfers only once its
+  negotiation is `FINALIZED` (`ControlPlaneGraph::agreement`). The
+  Agreement can reach the Consumer before it has processed the ACK of its
+  request, so a failed delivery is tried again after 0.2, 0.4 and 0.8 s
+  while the negotiation is still `AGREED`. If the
+  agreement still cannot be delivered the Provider terminates the negotiation,
+  unless the Consumer has verified it meanwhile (it is no longer
+  `AGREED`), and sends a best-effort `ContractNegotiationTerminationMessage` to
+  `.../:consumerPid/termination` (the Consumer may have stored the
+  Agreement despite the failure, e.g. after a timeout); a later Consumer
+  termination of it is a 200, not an error. Without a
+  `callbackAddress` the negotiation stays `REQUESTED`. A Consumer may
+  repeat its verification: the reply is a 200, and a negotiation still
+  `VERIFIED` is finalized then. At startup the Provider resumes its own
+  steps that a restart or a crash cut short (`negotiation::resume`): it
+  agrees to `REQUESTED`/`ACCEPTED` negotiations with a `callbackAddress`,
+  sends an `AGREED` negotiation's Agreement again (terminating as above
+  if that fails), and finalizes `VERIFIED` ones. Callbacks
+  (`crates/control-plane-http/src/callback.rs`) never follow redirects and
+  give up after 10 s; since the Consumer is not authenticated yet, the
+  callback address is whatever the requester sent.
 
 ### Stubbed
 
-- **Policy**: always-allow. `POST .../negotiations/request` never rejects
-  an offer, and `POST .../transfers/request` never checks the referenced
-  `agreementId` against a real, negotiated `Agreement` — there is no ODRL
-  constraint evaluation at all.
-- **Negotiation progression**: this control plane never *acts* as a
-  Provider deciding to agree, counter-offer, or finalize on its own —
-  moving a negotiation past `REQUESTED` requires an external actor driving
-  the same Provider HTTP endpoints a real counter-party (or, in the TCK's
-  case, the TCK itself acting as Consumer against `CN` tests that expect
-  the Provider to be the one moving the state forward) would.
+- **Policy**: always-allow. The Provider agrees to every offer as sent,
+  with no ODRL constraint evaluation and no check that the offer matches
+  one in the catalog. Offers whose terms the model cannot hold (a rule's
+  `duty`, `remedy` or `consequence`, a policy `profile`, a constraint's
+  `unit`, `rightOperandReference`, `dataType` or `status`) are refused
+  with a 400 `ContractNegotiationError` rather than agreed without them,
+  as are offers with neither a `permission` nor a `prohibition`, which
+  the DSP Offer and Agreement schemas require. It never counter-offers and never terminates on its
+  own except when an agreement cannot be delivered. Since it never sends
+  an Offer, a Consumer counter-request (`POST
+  /negotiations/:providerPid/request`) is refused with a 400
+  `ContractNegotiationError`: the spec allows one only from `OFFERED`.
+- **Agreement assignee**: there is no DCP yet, so the Consumer has no
+  verified participant id; the Agreement's `assignee` is its
+  `consumerPid`.
 - **Catalog seeding**: a fresh settings graph is seeded with exactly one
   dataset id (`urn:uuid:control-plane-rs-seed-dataset`); more can be added
   only through the Contreforts connector (there is no management HTTP API
@@ -204,7 +243,8 @@ and its new data services are written in one transaction.
 `GraphConfig` reads) to a directory and the store is RocksDB-backed:
 the catalog, negotiations and transfer processes survive a restart
 (`crates/control-plane-http/tests/persistence.rs` drives the real router,
-restarts on the same directory and reads everything back). Unset, the
+restarts on the same directory and reads everything back, including
+negotiations a restart caught in flight, which are resumed). Unset, the
 store is in memory as before. RocksDB is oxigraph's `rocksdb` feature,
 a from-source C++ build, on by default through `control-plane-graph`'s
 own `rocksdb` feature. Only one process can hold a store directory open:
@@ -259,9 +299,13 @@ from a counterparty may carry at most `MAX_RULES_PER_OFFER` (64) rules,
 `MAX_CONSTRAINTS_PER_RULE` (32) constraints per rule and a
 `MAX_OPERAND_BYTES` (4 KiB) `rightOperand`, or the request is a 400 and
 nothing is written; every route takes at most `MAX_BODY_BYTES` (256 KiB)
-of body (`crates/control-plane-http/tests/request_limits.rs`). Still not
-checked: that an offer's `target` or a transfer's `agreementId` names
-something this connector actually holds (the stub policy accepts any).
+of body (`crates/control-plane-http/tests/request_limits.rs`). A transfer's
+`agreementId` must name an agreement finalized here; still not checked:
+that an offer's `target` names a dataset this connector holds (the stub
+policy accepts any). Finalized negotiations hold the agreements transfers
+depend on, so eviction removes every other negotiation first; the record
+being written is never a candidate, so once every other negotiation is
+finalized a new one evicts the oldest finalized one rather than itself.
 
 ## TCK conformance snapshot
 
@@ -285,20 +329,24 @@ executed.
   Consumer-role groups cannot be excluded from the run itself. Instead,
   `crates/control-plane-http/tests/dsp_tck.rs` asserts the exact,
   documented set of failures this bootstrap's provider-only,
-  no-auto-progression scope implies — see that file's `EXPECTED_FAILURES`
+  provider-only, always-agree scope implies — see that file's `EXPECTED_FAILURES`
   for the full, commented list and why each entry fails.
 
-**Result: 65 tests run, 8 passed, 57 failed — exactly the documented set.**
+**Result: 65 tests run, 12 passed, 53 failed — exactly the documented set.**
+(Re-run on 2026-10-17 after the provider started retrying an undelivered
+Agreement and telling the Consumer when it then terminates, which made
+`CN:02-01` pass; the 2026-10-16 run had 11 passed, and the 2026-09-19 run
+8, with only `CN:02-02` in `CN`.)
 
 | Group | Total | Passed | Failed | Notes |
 |-------|------:|-------:|-------:|-------|
 | `MET` | 1 | 1 | 0 | Full pass, as expected — the metadata endpoint is fully implemented. |
 | `CAT` | 3 | 3 | 0 | Full pass. `CAT:01-01`/`CAT:01-02` needed `dsp.tck.properties`'s `CAT_01_01_DATASETID`/`CAT_01_02_DATASETID` overrides pointed at this bootstrap's one real seed dataset id (the TCK's own documented mechanism for this — see its README, "Catalog protocol"); `CAT:01-03` (not-found) passes with the TCK's own random default id. |
-| `CN` (provider) | 15 | 1 | 14 | Only `CN:02-02` (a purely reactive scenario: request, then a consumer-sent termination) passes. The other 14 all require this control plane to *spontaneously* push an Offer/Agreement/event/termination — this bootstrap's provider never acts on its own, only in response to inbound requests. |
+| `CN` (provider) | 15 | 5 | 10 | `CN:01-04`, `CN:02-03` and `CN:03-01` follow the agree, verify, finalize path; `CN:02-02` passes because terminating an already terminated negotiation succeeds. `CN:02-01` passes only incidentally: the TCK consumer refuses the Agreement, so after its retries the provider terminates and sends a `ContractNegotiationTerminationMessage` — not a policy decision to terminate. The other 10 need the provider to counter-offer first or to terminate on its own by policy, which an always-agree provider never does. |
 | `CN_C` (consumer) | 16 | 0 | 16 | Out of scope: no consumer-role HTTP surface at all. |
-| `TP` (provider) | 15 | 3 | 12 | `TP:03-01`, `TP:03-02` (reactive negative scenarios) and `TP:02-05` (a reactive termination) pass; the rest require the provider to spontaneously push a `TransferStartMessage`, which this bootstrap never does. |
+| `TP` (provider) | 15 | 3 | 12 | `TP:03-01`, `TP:03-02` (reactive negative scenarios) and `TP:02-05` (a reactive termination) pass; the rest require the provider to spontaneously push a `TransferStartMessage`, which this bootstrap never does. Every `TP` test sends `TP_NN_NN_AGREEMENTID` from `dsp.tck.properties`, an agreement `tests/dsp_tck.rs` stores as finalized before the run. |
 | `TP_C` (consumer) | 15 | 0 | 15 | Out of scope: no consumer-role HTTP surface at all. |
-| **Total** | **65** | **8** | **57** | |
+| **Total** | **65** | **12** | **53** | |
 
 Two things worth recording about how this snapshot was actually produced,
 not just its numbers:

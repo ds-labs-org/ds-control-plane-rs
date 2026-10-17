@@ -7,8 +7,13 @@
 //! expands this connector's bare `"REQUESTED"` to. Every record also
 //! carries `dcterms:modified`, which is what Contreforts' `pull(since)`
 //! filters on.
+//!
+//! A negotiation's `Agreement` is stored on it (`dspace:agreement`); an
+//! agreement counts as granted, for a transfer, once that negotiation is
+//! `FINALIZED` ([`ControlPlaneGraph::agreement`]).
 
 use chrono::{DateTime, Utc};
+use control_plane_core::common::Agreement;
 use control_plane_core::negotiation::{ContractNegotiation, NegotiationState};
 use control_plane_core::transfer::{TransferProcess, TransferState};
 use oxigraph::model::{NamedNode, NamedOrBlankNode, NamedOrBlankNodeRef};
@@ -17,7 +22,7 @@ use serde::de::DeserializeOwned;
 
 use crate::policy::{read_agreement, read_offer, write_agreement, write_offer};
 use crate::store::{ControlPlaneGraph, GraphError, Reader, Writer, iri, lookup_iri, readable};
-use crate::vocab::{RUNTIME_GRAPH, dcterms, dscp, dspace};
+use crate::vocab::{RUNTIME_GRAPH, dcterms, dscp, dspace, odrl};
 
 /// The most contract negotiations the runtime graph keeps. Once a write
 /// brings the store past it, the least recently modified negotiations
@@ -25,6 +30,9 @@ use crate::vocab::{RUNTIME_GRAPH, dcterms, dscp, dspace};
 /// reach `negotiations/request` can add one, and with RocksDB they stay on
 /// disk, so this is the ceiling on what such a caller can make the store
 /// hold. `ds-identity-hub-rs` caps its equivalent structures the same way.
+///
+/// Finalized negotiations hold the agreements transfers are checked
+/// against, so they are evicted only once no other negotiation is left.
 pub const MAX_NEGOTIATIONS: usize = 2048;
 
 /// The same ceiling for transfer processes.
@@ -66,6 +74,15 @@ fn read_state<S: DeserializeOwned>(
     })
 }
 
+/// Whether the negotiation `node` is `FINALIZED`; an unreadable state
+/// counts as not.
+fn is_finalized(r: &Reader<'_>, node: NamedOrBlankNodeRef<'_>) -> bool {
+    matches!(
+        read_state::<NegotiationState>(r, node),
+        Ok(NegotiationState::Finalized)
+    )
+}
+
 fn named(nodes: Vec<NamedOrBlankNode>) -> Vec<NamedNode> {
     nodes
         .into_iter()
@@ -86,6 +103,11 @@ fn write_negotiation(
     w.add_str(node.clone(), dspace("consumerPid"), &n.consumer_pid);
     w.add(node.clone(), dspace("state"), state_iri(n.state));
     w.add_opt_str(node.clone(), dscp("datasetId"), n.dataset_id.as_deref());
+    w.add_opt_str(
+        node.clone(),
+        dspace("callbackAddress"),
+        n.callback_address.as_deref(),
+    );
     if let Some(offer) = &n.offer {
         write_offer(&mut w, node.clone(), dspace("offer"), 0, offer);
     }
@@ -117,6 +139,7 @@ fn read_negotiation(
             dataset_id: r.opt_str(s, &dscp("datasetId"))?,
             offer,
             agreement,
+            callback_address: r.opt_str(s, &dspace("callbackAddress"))?,
         },
         modified: r.date_time(s, &dcterms("modified"))?,
     })
@@ -203,13 +226,43 @@ impl ControlPlaneGraph {
 
     /// Stores `negotiation`, replacing any record with the same
     /// `providerPid`, then evicts the least recently modified negotiations
-    /// past [`MAX_NEGOTIATIONS`].
+    /// past [`MAX_NEGOTIATIONS`], `FINALIZED` ones last. The negotiation just
+    /// stored is never evicted: once every other one is `FINALIZED`, the
+    /// oldest of those goes instead.
     pub fn put_negotiation(&self, negotiation: &ContractNegotiation) -> Result<(), GraphError> {
         let _guard = self.write_guard();
         let (node, quads) = write_negotiation(negotiation)?;
         let graph = runtime_graph();
         self.replace(&graph, &node, quads)?;
-        self.evict_oldest(&graph, &dspace("ContractNegotiation"), MAX_NEGOTIATIONS)
+        self.evict_oldest(
+            &graph,
+            &dspace("ContractNegotiation"),
+            MAX_NEGOTIATIONS,
+            node.as_ref().into(),
+            is_finalized,
+        )
+    }
+
+    /// The agreement `agreement_id`, if a negotiation this connector has
+    /// `FINALIZED` holds it. An agreement still being negotiated, or one
+    /// whose negotiation was terminated, grants nothing.
+    pub fn agreement(&self, agreement_id: &str) -> Result<Option<Agreement>, GraphError> {
+        let _guard = self.read_guard();
+        let graph = runtime_graph();
+        let r = self.reader(&graph);
+        for policy in r.subjects_with_str(&dscp("policyId"), agreement_id)? {
+            if !r.has_type(policy.as_ref(), &odrl("Agreement"))? {
+                continue;
+            }
+            for negotiation in r.subjects_linking_to(&dspace("agreement"), policy.as_ref())? {
+                if r.has_type(negotiation.as_ref(), &dspace("ContractNegotiation"))?
+                    && is_finalized(&r, negotiation.as_ref())
+                {
+                    return Ok(Some(read_agreement(&r, policy.as_ref())?));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Reads the negotiation `provider_pid`, applies `f`, and writes it back
@@ -276,7 +329,13 @@ impl ControlPlaneGraph {
         let (node, quads) = write_transfer(transfer)?;
         let graph = runtime_graph();
         self.replace(&graph, &node, quads)?;
-        self.evict_oldest(&graph, &dspace("TransferProcess"), MAX_TRANSFERS)
+        self.evict_oldest(
+            &graph,
+            &dspace("TransferProcess"),
+            MAX_TRANSFERS,
+            node.as_ref().into(),
+            |_, _| false,
+        )
     }
 
     /// Same as [`Self::update_negotiation`], for a transfer process.

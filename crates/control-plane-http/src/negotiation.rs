@@ -4,7 +4,8 @@
 //! (`/:callback/negotiations/...`) are out of scope for this pass — see
 //! `../../../ARCHITECTURE.md`.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -19,6 +20,7 @@ use control_plane_core::negotiation::{
 use control_plane_core::common::Offer;
 use control_plane_graph::GraphError;
 
+use crate::callback::CallbackError;
 use crate::state::AppState;
 
 /// The most rules (`permission`, `prohibition` and `obligation` together)
@@ -34,9 +36,13 @@ pub const MAX_CONSTRAINTS_PER_RULE: usize = 32;
 /// may carry.
 pub const MAX_OPERAND_BYTES: usize = 4096;
 
-/// Why `offer` is too large to store, or `None` if it is within the
-/// limits above.
-fn oversized(offer: &Offer) -> Option<String> {
+/// Why `offer` is too large to store, or has neither a permission nor a
+/// prohibition (which the DSP Offer and Agreement schemas require), or
+/// `None` if it is acceptable.
+fn invalid_offer(offer: &Offer) -> Option<String> {
+    if offer.permission.is_empty() && offer.prohibition.is_empty() {
+        return Some("an offer must carry a permission or a prohibition".to_string());
+    }
     let rules = || {
         offer
             .permission
@@ -66,15 +72,82 @@ fn oversized(offer: &Offer) -> Option<String> {
     None
 }
 
+/// Offer, rule and constraint keys this bootstrap's model cannot hold:
+/// serde would drop them on parsing, and the Provider would then agree to
+/// a different, usually weaker, policy than the one offered (e.g. a
+/// permission without its duty).
+const UNREPRESENTABLE_OFFER_KEYS: &[&str] = &["profile"];
+const UNREPRESENTABLE_RULE_KEYS: &[&str] = &["duty", "remedy", "consequence", "constraints"];
+const UNREPRESENTABLE_CONSTRAINT_KEYS: &[&str] =
+    &["unit", "rightOperandReference", "dataType", "status"];
+
+/// The first of `keys` that `object` carries with something in it: an
+/// empty list or `null` loses nothing when dropped.
+fn present(object: &serde_json::Value, keys: &[&'static str]) -> Option<&'static str> {
+    keys.iter().copied().find(|key| match object.get(*key) {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::Array(items)) => !items.is_empty(),
+        Some(_) => true,
+    })
+}
+
+/// The first term of the raw `offer` this bootstrap cannot represent, if
+/// any. An empty list or `null` loses nothing and is let through (the TCK
+/// sends `constraints: []`).
+fn unrepresentable(offer: &serde_json::Value) -> Option<String> {
+    let refuse = |key: &str| Some(format!("an offer's `{key}` is not supported"));
+    if let Some(key) = present(offer, UNREPRESENTABLE_OFFER_KEYS) {
+        return refuse(key);
+    }
+    let rules = ["permission", "prohibition", "obligation"]
+        .into_iter()
+        .filter_map(|kind| offer.get(kind)?.as_array())
+        .flatten();
+    for rule in rules {
+        if let Some(key) = present(rule, UNREPRESENTABLE_RULE_KEYS) {
+            return refuse(key);
+        }
+        let constraints = rule.get("constraint").and_then(|c| c.as_array());
+        for constraint in constraints.into_iter().flatten() {
+            if let Some(key) = present(constraint, UNREPRESENTABLE_CONSTRAINT_KEYS) {
+                return refuse(key);
+            }
+        }
+    }
+    None
+}
+
+/// A `ContractRequestMessage` body, plus whether its raw `offer` carried
+/// terms that parsing into [`ContractRequestMessage`] dropped.
+pub struct InboundRequest {
+    msg: ContractRequestMessage,
+    unrepresentable: Option<String>,
+}
+
+impl<'de> serde::Deserialize<'de> for InboundRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        let unrepresentable = raw.get("offer").and_then(unrepresentable);
+        let msg = serde_json::from_value(raw).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            msg,
+            unrepresentable,
+        })
+    }
+}
+
+/// A 400 refusing a request's offer. The DSP `ContractNegotiationError`
+/// schema requires a `providerPid`, so a refused initial request carries
+/// one minted for it even though nothing is stored under it.
 fn rejected_offer(
-    provider_pid: Option<&str>,
+    provider_pid: &str,
     consumer_pid: &str,
     reason: String,
 ) -> axum::response::Response {
     (
         StatusCode::BAD_REQUEST,
         Json(ContractNegotiationError::new(
-            provider_pid.map(str::to_string),
+            Some(provider_pid.to_string()),
             Some(consumer_pid.to_string()),
             "400",
             reason,
@@ -172,21 +245,45 @@ pub async fn get_negotiation(
 /// `POST {dsp}/negotiations/request` — initiates a new negotiation,
 /// `REQUESTED`. Always accepted: this bootstrap's stub policy never
 /// rejects an offer at this stage (see `../../../ARCHITECTURE.md`), unless
-/// it is past the size limits above.
+/// it has no permission or prohibition, is past the size limits above, or
+/// carries terms the model cannot hold
+/// ([`unrepresentable`]), or its `callbackAddress` cannot carry the DSP
+/// callback paths ([`crate::callback::check`]). With a `callbackAddress`, the
+/// Provider then agrees on its own ([`agree`]).
 pub async fn initiate_negotiation(
     State(state): State<Arc<AppState>>,
-    Json(msg): Json<ContractRequestMessage>,
+    Json(msg): Json<InboundRequest>,
 ) -> impl IntoResponse {
-    if let Some(reason) = oversized(&msg.offer) {
-        return rejected_offer(None, &msg.consumer_pid, reason);
-    }
+    let InboundRequest {
+        msg,
+        unrepresentable,
+    } = msg;
     let provider_pid = format!("urn:uuid:{}", uuid::Uuid::new_v4());
+    let unusable_callback = || {
+        let callback = msg.callback_address.as_deref()?;
+        crate::callback::check(callback, &msg.consumer_pid).err()
+    };
+    if let Some(reason) = unrepresentable
+        .or_else(|| invalid_offer(&msg.offer))
+        .or_else(unusable_callback)
+    {
+        return rejected_offer(&provider_pid, &msg.consumer_pid, reason);
+    }
     let mut negotiation = ContractNegotiation::new(provider_pid, msg.consumer_pid.clone());
     negotiation.dataset_id = msg.offer.target.clone();
     negotiation.offer = Some(msg.offer);
+    negotiation.callback_address = msg.callback_address;
     let stored = negotiation.clone();
     match state.with_graph(move |g| g.put_negotiation(&stored)).await {
-        Ok(()) => (StatusCode::CREATED, Json(negotiation.to_ack())).into_response(),
+        Ok(()) => {
+            if negotiation.callback_address.is_some() {
+                tokio::spawn(agree(
+                    Arc::downgrade(&state),
+                    negotiation.provider_pid.clone(),
+                ));
+            }
+            (StatusCode::CREATED, Json(negotiation.to_ack())).into_response()
+        }
         Err(e) => store_error(
             Some(&negotiation.provider_pid),
             Some(&negotiation.consumer_pid),
@@ -196,29 +293,47 @@ pub async fn initiate_negotiation(
 }
 
 /// `POST {dsp}/negotiations/:providerPid/request` — a Consumer counter-offer
-/// against an existing negotiation. This bootstrap records the new offer
-/// but does not itself decide to move to `OFFERED`/`AGREED` — see
-/// `../../../ARCHITECTURE.md` for why real auto-negotiation logic is out of
-/// scope for this pass.
+/// against an existing negotiation. Per the spec a Consumer may counter
+/// only a Provider Offer (`OFFERED` -> `REQUESTED`); in any other state the
+/// request is a 400 and the stored offer, which an Agreement may already
+/// be built from, is left alone. This Provider never sends an Offer, so in
+/// practice every counter-request is refused.
 pub async fn continue_negotiation(
     State(state): State<Arc<AppState>>,
     Path(provider_pid): Path<String>,
-    Json(msg): Json<ContractRequestMessage>,
+    Json(msg): Json<InboundRequest>,
 ) -> impl IntoResponse {
-    if let Some(reason) = oversized(&msg.offer) {
-        return rejected_offer(Some(&provider_pid), &msg.consumer_pid, reason);
+    let InboundRequest {
+        msg,
+        unrepresentable,
+    } = msg;
+    if let Some(reason) = unrepresentable.or_else(|| invalid_offer(&msg.offer)) {
+        return rejected_offer(&provider_pid, &msg.consumer_pid, reason);
     }
     let pid = provider_pid.clone();
     let result = state
         .with_graph(move |g| {
             g.update_negotiation(&pid, |n| {
+                let from = n.state;
+                n.transition(NegotiationState::Requested)
+                    .map_err(|_| (from, n.consumer_pid.clone()))?;
+                if msg.offer.target.is_some() {
+                    n.dataset_id = msg.offer.target.clone();
+                }
                 n.offer = Some(msg.offer);
-                Ok::<(), ()>(())
+                Ok(())
             })
         })
         .await;
     match result {
-        Ok(Some(_)) => StatusCode::OK.into_response(),
+        Ok(Some(Ok(()))) => StatusCode::OK.into_response(),
+        Ok(Some(Err((from, consumer_pid)))) => bad_transition(
+            &provider_pid,
+            &consumer_pid,
+            from,
+            NegotiationState::Requested,
+        )
+        .into_response(),
         Ok(None) => not_found(&provider_pid).into_response(),
         Err(e) => store_error(Some(&provider_pid), None, e),
     }
@@ -250,25 +365,350 @@ pub async fn negotiation_event(
         )
             .into_response();
     }
-    transition(&state, &provider_pid, NegotiationState::Accepted).await
+    let response = transition(&state, &provider_pid, NegotiationState::Accepted).await;
+    if response.status() == StatusCode::OK {
+        tokio::spawn(agree(Arc::downgrade(&state), provider_pid));
+    }
+    response
 }
 
-/// `POST {dsp}/negotiations/:providerPid/agreement/verification`.
+/// The Provider agrees to the negotiation `provider_pid`'s current offer
+/// (the stub policy agrees to every offer): it stores the Agreement,
+/// moves to `AGREED`, then sends the `ContractAgreementMessage` to the
+/// Consumer's callback address. The negotiation is `AGREED` before the
+/// message leaves, so a Consumer that verifies at once finds it there. If
+/// the Consumer cannot be reached the Provider terminates the negotiation,
+/// since the Consumer would otherwise never learn of the Agreement, and
+/// sends it a best-effort `ContractNegotiationTerminationMessage` -- unless
+/// the negotiation has left `AGREED` meanwhile (a verification proves the
+/// Consumer got the Agreement despite the failed reply).
+///
+/// It runs as a background task holding only a [`Weak`] handle on the app,
+/// so dropping the app releases the store at once; the task then stops at
+/// its next store access.
+pub async fn agree(state: Weak<AppState>, provider_pid: String) {
+    let Some(assigner) = state.upgrade().map(|s| s.config.agent_id.clone()) else {
+        return;
+    };
+    let pid = provider_pid.clone();
+    let agreed = AppState::with_graph_of(&state, move |g| {
+        g.update_negotiation(&pid, |n| {
+            let callback = n
+                .callback_address
+                .clone()
+                .ok_or_else(|| "no callbackAddress to send the agreement to".to_string())?;
+            // Without DCP the Consumer has no verified participant id
+            // yet; its consumerPid is the only name this Provider has
+            // for it.
+            let assignee = n.consumer_pid.clone();
+            let id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
+            let agreement = n
+                .agree(id, assigner, assignee, chrono::Utc::now())
+                .map_err(|e| e.to_string())?
+                .clone();
+            Ok::<_, String>((agreement, n.consumer_pid.clone(), callback))
+        })
+    })
+    .await;
+    let Some(agreed) = agreed else {
+        return;
+    };
+    let (agreement, consumer_pid, callback) = match agreed {
+        Ok(Some(Ok(agreed))) => agreed,
+        Ok(Some(Err(reason))) => {
+            tracing::warn!(%provider_pid, %reason, "not agreeing to negotiation");
+            return;
+        }
+        Ok(None) => return,
+        Err(error) => {
+            tracing::error!(%provider_pid, %error, "negotiation store error while agreeing");
+            return;
+        }
+    };
+    deliver_agreement(state, provider_pid, consumer_pid, callback, agreement).await;
+}
+
+/// How long the Provider waits before each new attempt to deliver an
+/// Agreement the Consumer did not take. The Agreement can arrive before
+/// the Consumer has processed the ACK of its own request, and a Consumer
+/// may refuse it until then, so one refusal does not end the negotiation.
+pub const AGREEMENT_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(200),
+    Duration::from_millis(400),
+    Duration::from_millis(800),
+];
+
+/// Whether the negotiation `provider_pid` is still `AGREED` with the
+/// Agreement `agreement_id`, i.e. still waiting for the Consumer to take it.
+/// `false` once the app is dropped.
+async fn awaiting_agreement(
+    state: &Weak<AppState>,
+    provider_pid: &str,
+    agreement_id: &str,
+) -> bool {
+    let pid = provider_pid.to_string();
+    let id = agreement_id.to_string();
+    matches!(
+        AppState::with_graph_of(state, move |g| g.negotiation(&pid)).await,
+        Some(Ok(Some(n))) if n.state == NegotiationState::Agreed
+            && n.agreement.as_ref().map(|a| &a.id) == Some(&id)
+    )
+}
+
+/// Sends `agreement` to the Consumer, again after each of
+/// [`AGREEMENT_RETRY_DELAYS`] while it fails and the negotiation is still
+/// `AGREED` with that Agreement; if every attempt fails terminates the
+/// negotiation if it is still `AGREED` with that Agreement, and tells the
+/// Consumer so (see [`agree`]).
+async fn deliver_agreement(
+    state: Weak<AppState>,
+    provider_pid: String,
+    consumer_pid: String,
+    callback: String,
+    agreement: control_plane_core::common::Agreement,
+) {
+    // A clone, so that no strong handle on the app is held while waiting
+    // on the Consumer.
+    let Some(callbacks) = state.upgrade().map(|s| s.callbacks.clone()) else {
+        return;
+    };
+    let agreement_id = agreement.id.clone();
+    let mut delays = AGREEMENT_RETRY_DELAYS.iter();
+    let sent = loop {
+        let sent = callbacks
+            .send_agreement(&callback, &provider_pid, &consumer_pid, agreement.clone())
+            .await;
+        let retryable = !matches!(sent, Ok(()) | Err(CallbackError::Unusable(_)));
+        match delays.next() {
+            Some(delay) if retryable => {
+                tracing::info!(%provider_pid, %callback, error = %sent.unwrap_err(), "could not send the agreement; retrying");
+                tokio::time::sleep(*delay).await;
+                if !awaiting_agreement(&state, &provider_pid, &agreement_id).await {
+                    return;
+                }
+            }
+            _ => break sent,
+        }
+    };
+    if let Err(error) = sent {
+        tracing::warn!(%provider_pid, %callback, %error, "could not send the agreement; terminating");
+        let pid = provider_pid.clone();
+        // Terminate only the negotiation as this call left it: a Consumer
+        // that has verified meanwhile holds the Agreement after all.
+        let terminated = AppState::with_graph_of(&state, move |g| {
+            g.update_negotiation(&pid, |n| {
+                let unanswered = n.state == NegotiationState::Agreed
+                    && n.agreement.as_ref().map(|a| &a.id) == Some(&agreement_id);
+                if unanswered {
+                    n.transition(NegotiationState::Terminated).map(|()| true)
+                } else {
+                    Ok(false)
+                }
+            })
+        })
+        .await;
+        let Some(terminated) = terminated else {
+            return;
+        };
+        match terminated {
+            Ok(Some(Ok(true))) => {}
+            Ok(Some(Ok(false))) => {
+                tracing::info!(%provider_pid, "the consumer verified the agreement anyway; not terminating");
+                return;
+            }
+            Ok(Some(Err(reason))) => {
+                tracing::warn!(%provider_pid, %reason, "not terminating negotiation");
+                return;
+            }
+            Ok(None) => return,
+            Err(error) => {
+                tracing::error!(%provider_pid, %error, "negotiation store error while terminating");
+                return;
+            }
+        }
+        // Best effort: the Consumer may have stored the Agreement anyway
+        // (a lost response, a timeout), so tell it the negotiation is over.
+        if let Err(error) = callbacks
+            .send_terminated(
+                &callback,
+                &provider_pid,
+                &consumer_pid,
+                "agreement-undeliverable",
+                format!("the agreement could not be delivered: {error}"),
+            )
+            .await
+        {
+            tracing::warn!(%provider_pid, %callback, %error, "could not send the termination");
+        }
+    }
+}
+
+/// The Provider finalizes the verified negotiation `provider_pid`:
+/// `FINALIZED`, which is what makes its Agreement grant transfers, then
+/// the `FINALIZED` event to the Consumer. The Consumer has already
+/// verified, so a failed delivery is logged and the negotiation stays
+/// finalized. Like [`agree`], it holds only a [`Weak`] handle on the app.
+pub async fn finalize(state: Weak<AppState>, provider_pid: String) {
+    let Some(callbacks) = state.upgrade().map(|s| s.callbacks.clone()) else {
+        return;
+    };
+    let pid = provider_pid.clone();
+    let finalized = AppState::with_graph_of(&state, move |g| {
+        g.update_negotiation(&pid, |n| {
+            n.transition(NegotiationState::Finalized)
+                .map_err(|e| e.to_string())?;
+            Ok::<_, String>((n.consumer_pid.clone(), n.callback_address.clone()))
+        })
+    })
+    .await;
+    let Some(finalized) = finalized else {
+        return;
+    };
+    let (consumer_pid, callback) = match finalized {
+        Ok(Some(Ok(finalized))) => finalized,
+        Ok(Some(Err(reason))) => {
+            tracing::warn!(%provider_pid, %reason, "not finalizing negotiation");
+            return;
+        }
+        Ok(None) => return,
+        Err(error) => {
+            tracing::error!(%provider_pid, %error, "negotiation store error while finalizing");
+            return;
+        }
+    };
+    let Some(callback) = callback else {
+        tracing::warn!(%provider_pid, "finalized, but no callbackAddress to tell the consumer");
+        return;
+    };
+    if let Err(error) = callbacks
+        .send_finalized(&callback, &provider_pid, &consumer_pid)
+        .await
+    {
+        tracing::warn!(%provider_pid, %callback, %error, "could not send the finalized event");
+    }
+}
+
+/// `POST {dsp}/negotiations/:providerPid/agreement/verification` — the
+/// Consumer verifies the Agreement, `VERIFIED`; the Provider then
+/// finalizes on its own ([`finalize`]). A repeated verification (a retry
+/// after a lost reply, or after a restart stopped the Provider before it
+/// finalized) is a 200: one still `VERIFIED` is finalized again, one
+/// already `FINALIZED` is left as it is.
 pub async fn verify_agreement(
     State(state): State<Arc<AppState>>,
     Path(provider_pid): Path<String>,
     Json(_msg): Json<ContractAgreementVerificationMessage>,
 ) -> impl IntoResponse {
-    transition(&state, &provider_pid, NegotiationState::Verified).await
+    let pid = provider_pid.clone();
+    // `Err(None)`: already verified, nothing to rewrite.
+    let result = state
+        .with_graph(move |g| {
+            g.update_negotiation(&pid, |n| {
+                let from = n.state;
+                if matches!(
+                    from,
+                    NegotiationState::Verified | NegotiationState::Finalized
+                ) {
+                    return Err(None);
+                }
+                n.transition(NegotiationState::Verified)
+                    .map_err(|_| Some((from, n.consumer_pid.clone())))
+            })
+        })
+        .await;
+    match result {
+        Ok(Some(Ok(()) | Err(None))) => {
+            // finalize() leaves a FINALIZED negotiation as it is.
+            tokio::spawn(finalize(Arc::downgrade(&state), provider_pid));
+            StatusCode::OK.into_response()
+        }
+        Ok(Some(Err(Some((from, consumer_pid))))) => bad_transition(
+            &provider_pid,
+            &consumer_pid,
+            from,
+            NegotiationState::Verified,
+        )
+        .into_response(),
+        Ok(None) => not_found(&provider_pid).into_response(),
+        Err(e) => store_error(Some(&provider_pid), None, e),
+    }
 }
 
-/// `POST {dsp}/negotiations/:providerPid/termination`.
+/// Resumes the Provider's own steps that a restart, a crash or a store
+/// error left undone: agrees to `REQUESTED` or `ACCEPTED` negotiations
+/// that have a `callbackAddress`, sends an `AGREED` negotiation's
+/// Agreement again (terminating it if that fails, as [`agree`] does), and
+/// finalizes `VERIFIED` ones. [`crate::build`] runs it at startup; an
+/// unreadable negotiation is skipped, and a store error is logged rather
+/// than stopping startup. The steps themselves run as spawned tasks.
+pub async fn resume(state: &Arc<AppState>) {
+    let negotiations = match state.with_graph(|g| g.negotiations()).await {
+        Ok(negotiations) => negotiations,
+        Err(error) => {
+            tracing::error!(%error, "could not list negotiations to resume");
+            return;
+        }
+    };
+    for n in negotiations.into_iter().map(|r| r.value) {
+        let pid = n.provider_pid;
+        match (n.state, n.callback_address, n.agreement) {
+            (NegotiationState::Requested | NegotiationState::Accepted, Some(_), _) => {
+                tokio::spawn(agree(Arc::downgrade(state), pid));
+            }
+            (NegotiationState::Agreed, Some(callback), Some(agreement)) => {
+                tokio::spawn(deliver_agreement(
+                    Arc::downgrade(state),
+                    pid,
+                    n.consumer_pid,
+                    callback,
+                    agreement,
+                ));
+            }
+            (NegotiationState::Verified, _, _) => {
+                tokio::spawn(finalize(Arc::downgrade(state), pid));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `POST {dsp}/negotiations/:providerPid/termination`. Terminating an
+/// already `TERMINATED` negotiation succeeds without a change: the
+/// Provider terminates on its own when it cannot deliver an agreement
+/// ([`agree`]), and the Consumer may not have heard of that yet.
 pub async fn terminate_negotiation(
     State(state): State<Arc<AppState>>,
     Path(provider_pid): Path<String>,
     Json(_msg): Json<ContractNegotiationTerminationMessage>,
 ) -> impl IntoResponse {
-    transition(&state, &provider_pid, NegotiationState::Terminated).await
+    let pid = provider_pid.clone();
+    // The check and the write share one write lock, so a termination racing
+    // another one (a retry, or the Provider's own) still sees TERMINATED.
+    // `Err(None)` means already terminated: nothing to rewrite.
+    let result = state
+        .with_graph(move |g| {
+            g.update_negotiation(&pid, |n| {
+                let from = n.state;
+                if from == NegotiationState::Terminated {
+                    return Err(None);
+                }
+                n.transition(NegotiationState::Terminated)
+                    .map_err(|_| Some((from, n.consumer_pid.clone())))
+            })
+        })
+        .await;
+    match result {
+        Ok(Some(Ok(()) | Err(None))) => StatusCode::OK.into_response(),
+        Ok(Some(Err(Some((from, consumer_pid))))) => bad_transition(
+            &provider_pid,
+            &consumer_pid,
+            from,
+            NegotiationState::Terminated,
+        )
+        .into_response(),
+        Ok(None) => not_found(&provider_pid).into_response(),
+        Err(e) => store_error(Some(&provider_pid), None, e),
+    }
 }
 
 #[cfg(test)]

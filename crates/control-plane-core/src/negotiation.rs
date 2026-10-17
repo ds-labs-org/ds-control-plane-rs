@@ -83,6 +83,10 @@ pub enum NegotiationError {
     },
     #[error("no contract negotiation with providerPid '{0}'")]
     NotFound(String),
+    #[error("the contract negotiation has no offer with a target to agree to")]
+    NoOffer,
+    #[error("the contract negotiation's offer has neither a permission nor a prohibition")]
+    NoRules,
 }
 
 /// Server-side record of one Contract Negotiation. This is this crate's own
@@ -96,6 +100,11 @@ pub struct ContractNegotiation {
     pub dataset_id: Option<String>,
     pub offer: Option<Offer>,
     pub agreement: Option<Agreement>,
+    /// Where the Consumer receives the Provider's messages for this
+    /// negotiation (the `callbackAddress` of its initial
+    /// `ContractRequestMessage`). `None` means this Provider has no way to
+    /// reach the Consumer, so it never moves the negotiation on by itself.
+    pub callback_address: Option<String>,
 }
 
 impl ContractNegotiation {
@@ -107,7 +116,53 @@ impl ContractNegotiation {
             dataset_id: None,
             offer: None,
             agreement: None,
+            callback_address: None,
         }
+    }
+
+    /// Agrees to the current offer as `assigner`, granting it to
+    /// `assignee`: builds the `Agreement` (id `agreement_id`, the offer's
+    /// rules, its `target` or else this negotiation's dataset, stamped
+    /// `now`), stores it on this negotiation and moves to `AGREED`. An
+    /// offer with neither a permission nor a prohibition is
+    /// [`NegotiationError::NoRules`]. Leaves the negotiation unchanged on
+    /// error.
+    pub fn agree(
+        &mut self,
+        agreement_id: impl Into<String>,
+        assigner: impl Into<String>,
+        assignee: impl Into<String>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<&Agreement, NegotiationError> {
+        if !is_valid_transition(self.state, NegotiationState::Agreed) {
+            return Err(NegotiationError::InvalidTransition {
+                from: self.state,
+                to: NegotiationState::Agreed,
+            });
+        }
+        let offer = self.offer.as_ref().ok_or(NegotiationError::NoOffer)?;
+        let target = offer
+            .target
+            .clone()
+            .or_else(|| self.dataset_id.clone())
+            .ok_or(NegotiationError::NoOffer)?;
+        // The DSP Agreement schema requires a permission or a prohibition.
+        if offer.permission.is_empty() && offer.prohibition.is_empty() {
+            return Err(NegotiationError::NoRules);
+        }
+        self.agreement = Some(Agreement {
+            id: agreement_id.into(),
+            type_: "Agreement".to_string(),
+            target,
+            timestamp: now,
+            assigner: assigner.into(),
+            assignee: assignee.into(),
+            permission: offer.permission.clone(),
+            prohibition: offer.prohibition.clone(),
+            obligation: offer.obligation.clone(),
+        });
+        self.state = NegotiationState::Agreed;
+        Ok(self.agreement.as_ref().expect("just set"))
     }
 
     /// Attempts to move this negotiation to `to`, validating the
@@ -372,5 +427,106 @@ mod tests {
             NegotiationState::Requested,
             "state must not change on a rejected transition"
         );
+    }
+
+    fn requested_with_offer() -> ContractNegotiation {
+        let mut n = ContractNegotiation::new("p1", "c1");
+        n.dataset_id = Some("urn:uuid:dataset".to_string());
+        n.offer = Some(Offer {
+            id: "urn:uuid:offer".to_string(),
+            type_: "Offer".to_string(),
+            target: Some("urn:uuid:dataset".to_string()),
+            permission: vec![crate::common::Rule {
+                action: "use".to_string(),
+                constraint: vec![],
+            }],
+            prohibition: vec![],
+            obligation: vec![],
+        });
+        n
+    }
+
+    #[test]
+    fn agreeing_builds_the_agreement_from_the_offer() {
+        let mut n = requested_with_offer();
+        let now = chrono::Utc::now();
+        let agreement = n
+            .agree("urn:uuid:agreement", "urn:provider", "urn:consumer", now)
+            .unwrap()
+            .clone();
+        assert_eq!(n.state, NegotiationState::Agreed);
+        assert_eq!(agreement.id, "urn:uuid:agreement");
+        assert_eq!(agreement.target, "urn:uuid:dataset");
+        assert_eq!(agreement.assigner, "urn:provider");
+        assert_eq!(agreement.assignee, "urn:consumer");
+        assert_eq!(agreement.timestamp, now);
+        assert_eq!(agreement.permission, n.offer.as_ref().unwrap().permission);
+        assert_eq!(n.agreement.as_ref(), Some(&agreement));
+    }
+
+    #[test]
+    fn agreeing_copies_every_rule_and_prefers_the_offer_target() {
+        let mut n = requested_with_offer();
+        let rule = |action: &str| crate::common::Rule {
+            action: action.to_string(),
+            constraint: vec![],
+        };
+        let offer = n.offer.as_mut().unwrap();
+        offer.target = Some("urn:uuid:offered-dataset".to_string());
+        offer.prohibition = vec![rule("distribute")];
+        offer.obligation = vec![rule("compensate")];
+        let agreement = n
+            .agree("urn:uuid:a", "urn:p", "urn:c", chrono::Utc::now())
+            .unwrap()
+            .clone();
+        assert_eq!(agreement.target, "urn:uuid:offered-dataset");
+        assert_eq!(agreement.prohibition, vec![rule("distribute")]);
+        assert_eq!(agreement.obligation, vec![rule("compensate")]);
+    }
+
+    #[test]
+    fn agreeing_falls_back_to_the_dataset_when_the_offer_has_no_target() {
+        let mut n = requested_with_offer();
+        n.offer.as_mut().unwrap().target = None;
+        let agreement = n
+            .agree("urn:uuid:a", "urn:p", "urn:c", chrono::Utc::now())
+            .unwrap();
+        assert_eq!(agreement.target, "urn:uuid:dataset");
+    }
+
+    #[test]
+    fn agreeing_to_an_offer_without_a_permission_or_prohibition_fails() {
+        let mut n = requested_with_offer();
+        let offer = n.offer.as_mut().unwrap();
+        offer.permission.clear();
+        offer.obligation = vec![crate::common::Rule {
+            action: "compensate".to_string(),
+            constraint: vec![],
+        }];
+        assert!(matches!(
+            n.agree("urn:uuid:a", "urn:p", "urn:c", chrono::Utc::now()),
+            Err(NegotiationError::NoRules)
+        ));
+        assert_eq!(n.state, NegotiationState::Requested);
+        assert!(n.agreement.is_none());
+    }
+
+    #[test]
+    fn agreeing_without_an_offer_or_from_a_late_state_changes_nothing() {
+        let mut n = ContractNegotiation::new("p1", "c1");
+        assert!(matches!(
+            n.agree("urn:uuid:a", "urn:p", "urn:c", chrono::Utc::now()),
+            Err(NegotiationError::NoOffer)
+        ));
+        assert_eq!(n.state, NegotiationState::Requested);
+        assert!(n.agreement.is_none());
+
+        let mut n = requested_with_offer();
+        n.state = NegotiationState::Verified;
+        assert!(matches!(
+            n.agree("urn:uuid:a", "urn:p", "urn:c", chrono::Utc::now()),
+            Err(NegotiationError::InvalidTransition { .. })
+        ));
+        assert!(n.agreement.is_none());
     }
 }

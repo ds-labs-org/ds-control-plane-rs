@@ -7,6 +7,7 @@
 //! See `../../ARCHITECTURE.md` for what this bootstrap implements,
 //! stubs, and leaves out of scope.
 
+pub mod callback;
 pub mod catalog;
 pub mod config;
 pub mod metadata;
@@ -51,7 +52,8 @@ pub async fn build(config: Config) -> anyhow::Result<App> {
     let dsp = &config.dsp_path;
     let state = Arc::new(AppState::open(config.clone())?);
     // Counts by type only: decoding every record here would make startup
-    // O(all records) and let one damaged record stop the server.
+    // O(all records) and let one damaged record stop the server. Only
+    // negotiations are read, by `resume` below, which skips damaged ones.
     tracing::info!(
         store = ?config.store_path,
         datasets = state.graph.dataset_count()?,
@@ -59,6 +61,11 @@ pub async fn build(config: Config) -> anyhow::Result<App> {
         transfers = state.graph.transfer_count()?,
         "opened control plane graph"
     );
+
+    // Reads every negotiation (at most `MAX_NEGOTIATIONS`, an unreadable
+    // one skipped) before serving, so work left undone by the last run is
+    // picked up; only negotiations with such work spawn a task.
+    negotiation::resume(&state).await;
 
     let graph = state.graph.clone();
     let router = Router::new()
