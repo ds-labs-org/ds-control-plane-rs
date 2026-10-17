@@ -492,6 +492,7 @@ async fn a_transfer_needs_a_finalized_agreement() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(err["@type"], "TransferError");
     assert_eq!(err["consumerPid"], "urn:uuid:t1");
+    assert_eq!(app.graph.transfer_count().unwrap(), 0);
 
     let (_, agreement_id) = finalized(&app.router, &consumer, &callback).await;
     let (status, ack) = call(

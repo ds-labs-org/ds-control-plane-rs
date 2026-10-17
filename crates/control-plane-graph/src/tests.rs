@@ -724,6 +724,10 @@ fn an_agreement_is_found_only_once_its_negotiation_is_finalized() {
     graph.put_negotiation(&n).unwrap();
     assert!(graph.agreement("urn:uuid:agreement").unwrap().is_none());
 
+    n.state = NegotiationState::Verified;
+    graph.put_negotiation(&n).unwrap();
+    assert!(graph.agreement("urn:uuid:agreement").unwrap().is_none());
+
     n.state = NegotiationState::Finalized;
     graph.put_negotiation(&n).unwrap();
     let found = graph.agreement("urn:uuid:agreement").unwrap().unwrap();

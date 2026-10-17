@@ -465,6 +465,26 @@ mod tests {
     }
 
     #[test]
+    fn agreeing_copies_every_rule_and_prefers_the_offer_target() {
+        let mut n = requested_with_offer();
+        let rule = |action: &str| crate::common::Rule {
+            action: action.to_string(),
+            constraint: vec![],
+        };
+        let offer = n.offer.as_mut().unwrap();
+        offer.target = Some("urn:uuid:offered-dataset".to_string());
+        offer.prohibition = vec![rule("distribute")];
+        offer.obligation = vec![rule("compensate")];
+        let agreement = n
+            .agree("urn:uuid:a", "urn:p", "urn:c", chrono::Utc::now())
+            .unwrap()
+            .clone();
+        assert_eq!(agreement.target, "urn:uuid:offered-dataset");
+        assert_eq!(agreement.prohibition, vec![rule("distribute")]);
+        assert_eq!(agreement.obligation, vec![rule("compensate")]);
+    }
+
+    #[test]
     fn agreeing_falls_back_to_the_dataset_when_the_offer_has_no_target() {
         let mut n = requested_with_offer();
         n.offer.as_mut().unwrap().target = None;
