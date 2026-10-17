@@ -105,7 +105,7 @@ pub async fn initiate_transfer(
         Ok(false) => (
             StatusCode::BAD_REQUEST,
             Json(TransferErrorMessage::new(
-                None,
+                Some(transfer.provider_pid.clone()),
                 Some(transfer.consumer_pid.clone()),
                 "400",
                 format!(
