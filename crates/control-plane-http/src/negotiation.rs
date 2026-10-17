@@ -136,15 +136,18 @@ impl<'de> serde::Deserialize<'de> for InboundRequest {
     }
 }
 
+/// A 400 refusing a request's offer. The DSP `ContractNegotiationError`
+/// schema requires a `providerPid`, so a refused initial request carries
+/// one minted for it even though nothing is stored under it.
 fn rejected_offer(
-    provider_pid: Option<&str>,
+    provider_pid: &str,
     consumer_pid: &str,
     reason: String,
 ) -> axum::response::Response {
     (
         StatusCode::BAD_REQUEST,
         Json(ContractNegotiationError::new(
-            provider_pid.map(str::to_string),
+            Some(provider_pid.to_string()),
             Some(consumer_pid.to_string()),
             "400",
             reason,
@@ -255,6 +258,7 @@ pub async fn initiate_negotiation(
         msg,
         unrepresentable,
     } = msg;
+    let provider_pid = format!("urn:uuid:{}", uuid::Uuid::new_v4());
     let unusable_callback = || {
         let callback = msg.callback_address.as_deref()?;
         crate::callback::check(callback, &msg.consumer_pid).err()
@@ -263,9 +267,8 @@ pub async fn initiate_negotiation(
         .or_else(|| invalid_offer(&msg.offer))
         .or_else(unusable_callback)
     {
-        return rejected_offer(None, &msg.consumer_pid, reason);
+        return rejected_offer(&provider_pid, &msg.consumer_pid, reason);
     }
-    let provider_pid = format!("urn:uuid:{}", uuid::Uuid::new_v4());
     let mut negotiation = ContractNegotiation::new(provider_pid, msg.consumer_pid.clone());
     negotiation.dataset_id = msg.offer.target.clone();
     negotiation.offer = Some(msg.offer);
@@ -305,7 +308,7 @@ pub async fn continue_negotiation(
         unrepresentable,
     } = msg;
     if let Some(reason) = unrepresentable.or_else(|| invalid_offer(&msg.offer)) {
-        return rejected_offer(Some(&provider_pid), &msg.consumer_pid, reason);
+        return rejected_offer(&provider_pid, &msg.consumer_pid, reason);
     }
     let pid = provider_pid.clone();
     let result = state
