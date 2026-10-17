@@ -23,6 +23,11 @@ struct Consumer {
     received: Arc<Mutex<Vec<(String, Value)>>>,
     /// Answers 500 to the agreement callback, after recording it.
     fails_agreement: bool,
+    /// Verifies the Agreement with this Provider before answering 502 to
+    /// the agreement callback, as when the Consumer processed the
+    /// Agreement but a proxy fails its reply.
+    verifies_then_fails: Option<axum::Router>,
+    verifications: Arc<Mutex<Vec<(String, StatusCode)>>>,
 }
 
 impl Consumer {
@@ -40,7 +45,28 @@ async fn record(
         .received
         .lock()
         .unwrap()
-        .push((format!("/negotiations/{pid}/{kind}"), body));
+        .push((format!("/negotiations/{pid}/{kind}"), body.clone()));
+    if let (Some(provider), "agreement") = (&consumer.verifies_then_fails, kind.as_str()) {
+        let provider_pid = body["providerPid"].as_str().unwrap().to_string();
+        let (status, _) = call(
+            provider,
+            "POST",
+            &format!("/negotiations/{provider_pid}/agreement/verification"),
+            Some(json!({
+                "@context": ["https://w3id.org/dspace/2025/1/context.jsonld"],
+                "@type": "ContractAgreementVerificationMessage",
+                "providerPid": provider_pid,
+                "consumerPid": pid
+            })),
+        )
+        .await;
+        consumer
+            .verifications
+            .lock()
+            .unwrap()
+            .push((provider_pid, status));
+        return StatusCode::BAD_GATEWAY;
+    }
     if consumer.fails_agreement && kind == "agreement" {
         StatusCode::INTERNAL_SERVER_ERROR
     } else {
@@ -289,6 +315,58 @@ async fn a_rejected_agreement_terminates_and_tells_the_consumer() {
     assert_eq!(msg["providerPid"], provider_pid.as_str());
     assert_eq!(msg["consumerPid"], "urn:uuid:c1");
     assert!(msg["code"].is_string());
+}
+
+/// A Consumer whose verification the Provider answered 200 holds the
+/// Agreement, so a failed reply to the agreement callback that arrives
+/// after the verification must not terminate the negotiation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_verified_negotiation_is_finalized_even_if_the_agreement_reply_failed() {
+    let app = app().await;
+    let (consumer, callback) = serve(Consumer {
+        verifies_then_fails: Some(app.router.clone()),
+        ..Consumer::default()
+    })
+    .await;
+    let mut provider_pids = Vec::new();
+    for i in 0..20 {
+        let (status, ack) = call(
+            &app.router,
+            "POST",
+            "/negotiations/request",
+            Some(request(&format!("urn:uuid:c{i}"), Some(&callback))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        provider_pids.push(ack["providerPid"].as_str().unwrap().to_string());
+    }
+    for _ in 0..100 {
+        if consumer.verifications.lock().unwrap().len() == provider_pids.len() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let verifications = consumer.verifications.lock().unwrap().clone();
+    assert_eq!(verifications.len(), provider_pids.len());
+    for (provider_pid, status) in verifications {
+        assert_eq!(status, StatusCode::OK);
+        let mut state = Value::Null;
+        for _ in 0..100 {
+            let (_, ack) = call(
+                &app.router,
+                "GET",
+                &format!("/negotiations/{provider_pid}"),
+                None,
+            )
+            .await;
+            state = ack["state"].clone();
+            if state == "FINALIZED" || state == "TERMINATED" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(state, "FINALIZED", "negotiation {provider_pid}");
+    }
 }
 
 #[tokio::test]
