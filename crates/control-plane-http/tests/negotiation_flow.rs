@@ -444,6 +444,41 @@ async fn an_offer_without_a_permission_or_prohibition_is_refused() {
     assert!(app.graph.negotiations().unwrap().is_empty());
 }
 
+/// The DSP path is appended to the `callbackAddress`, so one with a query
+/// or fragment (or a non-HTTP scheme) would put it in the wrong place, and
+/// a `consumerPid` of `.` or `..` would be resolved away by the URL parser:
+/// all refused at request time rather than sent somewhere else.
+#[tokio::test]
+async fn a_callback_url_that_cannot_hold_the_dsp_path_is_refused() {
+    let (consumer, callback) = consumer().await;
+    let app = app().await;
+    let cases = [
+        ("urn:uuid:c1", format!("{callback}?x=1")),
+        ("urn:uuid:c1", format!("{callback}#frag")),
+        ("urn:uuid:c1", "ftp://consumer.example/cb".to_string()),
+        ("urn:uuid:c1", "not a url".to_string()),
+        ("..", callback.clone()),
+        (".", callback.clone()),
+    ];
+    for (consumer_pid, callback) in cases {
+        let msg = request(consumer_pid, Some(&callback));
+        let (status, error) = call(&app.router, "POST", "/negotiations/request", Some(msg)).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{consumer_pid} at {callback} was accepted"
+        );
+        assert_eq!(error["@type"], "ContractNegotiationError");
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        consumer.received().is_empty(),
+        "a message was sent: {:?}",
+        consumer.received()
+    );
+    assert!(app.graph.negotiations().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn without_a_callback_address_the_negotiation_waits() {
     let app = app().await;

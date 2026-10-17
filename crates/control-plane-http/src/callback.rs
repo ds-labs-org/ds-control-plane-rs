@@ -155,4 +155,20 @@ mod tests {
             "http://c.example/cb/negotiations/a%2Fb%3Fc%23d%25e%20f/events"
         );
     }
+
+    /// What reqwest actually sends: the WHATWG parser turns `\\` into `/`
+    /// and drops tabs, so those must be escaped too.
+    #[test]
+    fn the_parsed_url_keeps_the_consumer_pid_as_one_segment() {
+        for (pid, escaped) in [("a\\b", "a%5Cb"), ("a\tb", "a%09b"), ("a\nb", "a%0Ab")] {
+            let parsed =
+                reqwest::Url::parse(&url("http://c.example/cb", pid, "agreement")).unwrap();
+            let segments: Vec<_> = parsed.path_segments().unwrap().collect();
+            assert_eq!(
+                segments,
+                ["cb", "negotiations", escaped, "agreement"],
+                "{pid:?}"
+            );
+        }
+    }
 }
