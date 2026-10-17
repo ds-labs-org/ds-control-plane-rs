@@ -21,6 +21,8 @@ const DSP: &str = "/dsp/2025-1";
 #[derive(Clone, Default)]
 struct Consumer {
     received: Arc<Mutex<Vec<(String, Value)>>>,
+    /// Answers 500 to the agreement callback, after recording it.
+    fails_agreement: bool,
 }
 
 impl Consumer {
@@ -39,12 +41,19 @@ async fn record(
         .lock()
         .unwrap()
         .push((format!("/negotiations/{pid}/{kind}"), body));
-    StatusCode::OK
+    if consumer.fails_agreement && kind == "agreement" {
+        StatusCode::INTERNAL_SERVER_ERROR
+    } else {
+        StatusCode::OK
+    }
 }
 
 /// Starts the stand-in Consumer; returns it and its callback address.
 async fn consumer() -> (Consumer, String) {
-    let consumer = Consumer::default();
+    serve(Consumer::default()).await
+}
+
+async fn serve(consumer: Consumer) -> (Consumer, String) {
     let router = axum::Router::new()
         .route("/callback/negotiations/{pid}/{kind}", post(record))
         .with_state(consumer.clone());
@@ -251,6 +260,35 @@ async fn an_unreachable_consumer_terminates_the_negotiation() {
     .await;
     let provider_pid = ack["providerPid"].as_str().unwrap().to_string();
     wait_for_state(&app.router, &provider_pid, "TERMINATED").await;
+}
+
+/// A Consumer that rejects the Agreement is told the Provider terminated
+/// the negotiation, so both sides end up TERMINATED.
+#[tokio::test]
+async fn a_rejected_agreement_terminates_and_tells_the_consumer() {
+    let (consumer, callback) = serve(Consumer {
+        fails_agreement: true,
+        ..Consumer::default()
+    })
+    .await;
+    let app = app().await;
+    let (_, ack) = call(
+        &app.router,
+        "POST",
+        "/negotiations/request",
+        Some(request("urn:uuid:c1", Some(&callback))),
+    )
+    .await;
+    let provider_pid = ack["providerPid"].as_str().unwrap().to_string();
+    wait_for_state(&app.router, &provider_pid, "TERMINATED").await;
+    let received = wait_for_messages(&consumer, 2).await;
+    assert_eq!(received[0].0, "/negotiations/urn:uuid:c1/agreement");
+    let (path, msg) = &received[1];
+    assert_eq!(path, "/negotiations/urn:uuid:c1/termination");
+    assert_eq!(msg["@type"], "ContractNegotiationTerminationMessage");
+    assert_eq!(msg["providerPid"], provider_pid.as_str());
+    assert_eq!(msg["consumerPid"], "urn:uuid:c1");
+    assert!(msg["code"].is_string());
 }
 
 #[tokio::test]
