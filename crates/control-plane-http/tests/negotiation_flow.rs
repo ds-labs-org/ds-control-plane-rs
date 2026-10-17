@@ -491,6 +491,11 @@ async fn an_offer_without_a_permission_or_prohibition_is_refused() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{rules} was accepted");
         assert_eq!(error["@type"], "ContractNegotiationError");
         assert_eq!(error["consumerPid"], "urn:uuid:c1");
+        // The DSP ContractNegotiationError schema requires a providerPid.
+        assert!(
+            error["providerPid"].is_string(),
+            "ContractNegotiationError needs providerPid: {error}"
+        );
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
@@ -526,6 +531,10 @@ async fn a_callback_url_that_cannot_hold_the_dsp_path_is_refused() {
             "{consumer_pid} at {callback} was accepted"
         );
         assert_eq!(error["@type"], "ContractNegotiationError");
+        assert!(
+            error["providerPid"].is_string(),
+            "ContractNegotiationError needs providerPid: {error}"
+        );
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
