@@ -760,3 +760,20 @@ fn eviction_keeps_finalized_negotiations_over_newer_open_ones() {
     assert!(graph.negotiation("urn:uuid:open0").unwrap().is_none());
     assert!(graph.agreement("urn:uuid:agreement").unwrap().is_some());
 }
+
+#[test]
+fn a_new_negotiation_is_never_evicted_by_its_own_write() {
+    let graph = ControlPlaneGraph::open_in_memory().unwrap();
+    for i in 0..MAX_NEGOTIATIONS {
+        let mut n = negotiation();
+        n.provider_pid = format!("urn:uuid:finalized{i}");
+        n.agreement = None;
+        n.state = NegotiationState::Finalized;
+        graph.put_negotiation(&n).unwrap();
+    }
+    let fresh = ContractNegotiation::new("urn:uuid:fresh", "urn:uuid:c-fresh");
+    graph.put_negotiation(&fresh).unwrap();
+    assert_eq!(graph.negotiation_count().unwrap(), MAX_NEGOTIATIONS);
+    assert!(graph.negotiation("urn:uuid:fresh").unwrap().is_some());
+    assert!(graph.negotiation("urn:uuid:finalized0").unwrap().is_none());
+}
