@@ -119,7 +119,9 @@ side of a connector.
   one in the catalog. Offers whose terms the model cannot hold (a rule's
   `duty`, `remedy` or `consequence`, a policy `profile`, a constraint's
   `unit`, `rightOperandReference`, `dataType` or `status`) are refused
-  with a 400 `ContractNegotiationError` rather than agreed without them. It never counter-offers and never terminates on its
+  with a 400 `ContractNegotiationError` rather than agreed without them,
+  as are offers with neither a `permission` nor a `prohibition`, which
+  the DSP Offer and Agreement schemas require. It never counter-offers and never terminates on its
   own except when an agreement cannot be delivered. Since it never sends
   an Offer, a Consumer counter-request (`POST
   /negotiations/:providerPid/request`) is refused with a 400

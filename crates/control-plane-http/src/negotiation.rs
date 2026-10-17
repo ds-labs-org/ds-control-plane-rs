@@ -34,9 +34,13 @@ pub const MAX_CONSTRAINTS_PER_RULE: usize = 32;
 /// may carry.
 pub const MAX_OPERAND_BYTES: usize = 4096;
 
-/// Why `offer` is too large to store, or `None` if it is within the
-/// limits above.
-fn oversized(offer: &Offer) -> Option<String> {
+/// Why `offer` is too large to store, or has neither a permission nor a
+/// prohibition (which the DSP Offer and Agreement schemas require), or
+/// `None` if it is acceptable.
+fn invalid_offer(offer: &Offer) -> Option<String> {
+    if offer.permission.is_empty() && offer.prohibition.is_empty() {
+        return Some("an offer must carry a permission or a prohibition".to_string());
+    }
     let rules = || {
         offer
             .permission
@@ -236,7 +240,8 @@ pub async fn get_negotiation(
 /// `POST {dsp}/negotiations/request` — initiates a new negotiation,
 /// `REQUESTED`. Always accepted: this bootstrap's stub policy never
 /// rejects an offer at this stage (see `../../../ARCHITECTURE.md`), unless
-/// it is past the size limits above or carries terms the model cannot hold
+/// it has no permission or prohibition, is past the size limits above, or
+/// carries terms the model cannot hold
 /// ([`unrepresentable`]). With a `callbackAddress`, the
 /// Provider then agrees on its own ([`agree`]).
 pub async fn initiate_negotiation(
@@ -247,7 +252,7 @@ pub async fn initiate_negotiation(
         msg,
         unrepresentable,
     } = msg;
-    if let Some(reason) = unrepresentable.or_else(|| oversized(&msg.offer)) {
+    if let Some(reason) = unrepresentable.or_else(|| invalid_offer(&msg.offer)) {
         return rejected_offer(None, &msg.consumer_pid, reason);
     }
     let provider_pid = format!("urn:uuid:{}", uuid::Uuid::new_v4());
@@ -286,7 +291,7 @@ pub async fn continue_negotiation(
         msg,
         unrepresentable,
     } = msg;
-    if let Some(reason) = unrepresentable.or_else(|| oversized(&msg.offer)) {
+    if let Some(reason) = unrepresentable.or_else(|| invalid_offer(&msg.offer)) {
         return rejected_offer(Some(&provider_pid), &msg.consumer_pid, reason);
     }
     let pid = provider_pid.clone();

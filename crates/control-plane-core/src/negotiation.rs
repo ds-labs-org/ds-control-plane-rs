@@ -85,6 +85,8 @@ pub enum NegotiationError {
     NotFound(String),
     #[error("the contract negotiation has no offer with a target to agree to")]
     NoOffer,
+    #[error("the contract negotiation's offer has neither a permission nor a prohibition")]
+    NoRules,
 }
 
 /// Server-side record of one Contract Negotiation. This is this crate's own
@@ -121,8 +123,10 @@ impl ContractNegotiation {
     /// Agrees to the current offer as `assigner`, granting it to
     /// `assignee`: builds the `Agreement` (id `agreement_id`, the offer's
     /// rules, its `target` or else this negotiation's dataset, stamped
-    /// `now`), stores it on this negotiation and moves to `AGREED`. Leaves
-    /// the negotiation unchanged on error.
+    /// `now`), stores it on this negotiation and moves to `AGREED`. An
+    /// offer with neither a permission nor a prohibition is
+    /// [`NegotiationError::NoRules`]. Leaves the negotiation unchanged on
+    /// error.
     pub fn agree(
         &mut self,
         agreement_id: impl Into<String>,
@@ -142,6 +146,10 @@ impl ContractNegotiation {
             .clone()
             .or_else(|| self.dataset_id.clone())
             .ok_or(NegotiationError::NoOffer)?;
+        // The DSP Agreement schema requires a permission or a prohibition.
+        if offer.permission.is_empty() && offer.prohibition.is_empty() {
+            return Err(NegotiationError::NoRules);
+        }
         self.agreement = Some(Agreement {
             id: agreement_id.into(),
             type_: "Agreement".to_string(),
