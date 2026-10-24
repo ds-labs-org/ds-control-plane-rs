@@ -77,6 +77,11 @@ pub struct TransferProcess {
     pub state: TransferState,
     pub agreement_id: String,
     pub format: String,
+    /// The DID of the participant DCP authenticated when this transfer was
+    /// requested, the assignee of its agreement: the only participant whose
+    /// later messages on it are accepted. `None` when the request was not
+    /// authenticated (DCP off).
+    pub participant_id: Option<String>,
 }
 
 impl TransferProcess {
@@ -92,6 +97,7 @@ impl TransferProcess {
             state: TransferState::Requested,
             agreement_id: agreement_id.into(),
             format: format.into(),
+            participant_id: None,
         }
     }
 
