@@ -5,11 +5,17 @@
 //! event to `{callback}/negotiations/:consumerPid/events` and its own
 //! termination to `{callback}/negotiations/:consumerPid/termination`.
 //!
-//! The callback address comes from the Consumer's own request and nothing
-//! authenticates that Consumer yet (no DCP), so this client never follows
-//! redirects and gives up after [`TIMEOUT`].
+//! The callback address comes from the Consumer's own request, so this
+//! client never follows redirects and gives up after [`TIMEOUT`]. With DCP
+//! on, each callback carries `Authorization: Bearer <token>`, a
+//! Self-Issued ID Token this connector mints for the negotiation's
+//! authenticated participant (`aud` its DID), so the Consumer can
+//! authenticate the Provider in turn.
 
+use std::sync::Arc;
 use std::time::Duration;
+
+use control_plane_dcp::Dcp;
 
 use control_plane_core::common::Agreement;
 use control_plane_core::dsp_context;
@@ -55,27 +61,26 @@ pub fn check(callback: &str, consumer_pid: &str) -> Result<(), String> {
 #[derive(Clone)]
 pub struct Callbacks {
     client: reqwest::Client,
-}
-
-impl Default for Callbacks {
-    fn default() -> Self {
-        Self::new()
-    }
+    dcp: Option<Arc<Dcp>>,
 }
 
 impl Callbacks {
-    pub fn new() -> Self {
+    /// With `dcp`, callbacks to a negotiation bound to a participant carry
+    /// a token minted for it.
+    pub fn new(dcp: Option<Arc<Dcp>>) -> Self {
         let client = reqwest::Client::builder()
             .timeout(TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("a client with only a timeout and no redirects always builds");
-        Self { client }
+        Self { client, dcp }
     }
 
-    /// Sends `agreement` for the negotiation `provider_pid`/`consumer_pid`.
+    /// Sends `agreement` for the negotiation `provider_pid`/`consumer_pid`
+    /// of `participant` (`None` with DCP off).
     pub async fn send_agreement(
         &self,
+        participant: Option<&str>,
         callback: &str,
         provider_pid: &str,
         consumer_pid: &str,
@@ -89,13 +94,14 @@ impl Callbacks {
             agreement,
         };
         check(callback, consumer_pid).map_err(CallbackError::Unusable)?;
-        self.post(&url(callback, consumer_pid, "agreement"), &msg)
+        self.post(participant, &url(callback, consumer_pid, "agreement"), &msg)
             .await
     }
 
     /// Tells the Consumer the negotiation is `FINALIZED`.
     pub async fn send_finalized(
         &self,
+        participant: Option<&str>,
         callback: &str,
         provider_pid: &str,
         consumer_pid: &str,
@@ -108,13 +114,14 @@ impl Callbacks {
             event_type: NegotiationEventType::Finalized,
         };
         check(callback, consumer_pid).map_err(CallbackError::Unusable)?;
-        self.post(&url(callback, consumer_pid, "events"), &msg)
+        self.post(participant, &url(callback, consumer_pid, "events"), &msg)
             .await
     }
 
     /// Tells the Consumer this Provider terminated the negotiation.
     pub async fn send_terminated(
         &self,
+        participant: Option<&str>,
         callback: &str,
         provider_pid: &str,
         consumer_pid: &str,
@@ -130,12 +137,25 @@ impl Callbacks {
             reason: vec![reason],
         };
         check(callback, consumer_pid).map_err(CallbackError::Unusable)?;
-        self.post(&url(callback, consumer_pid, "termination"), &msg)
-            .await
+        self.post(
+            participant,
+            &url(callback, consumer_pid, "termination"),
+            &msg,
+        )
+        .await
     }
 
-    async fn post(&self, url: &str, body: &impl serde::Serialize) -> Result<(), CallbackError> {
-        let response = self.client.post(url).json(body).send().await?;
+    async fn post(
+        &self,
+        participant: Option<&str>,
+        url: &str,
+        body: &impl serde::Serialize,
+    ) -> Result<(), CallbackError> {
+        let mut request = self.client.post(url).json(body);
+        if let (Some(dcp), Some(participant)) = (&self.dcp, participant) {
+            request = request.bearer_auth(dcp.mint_self_issued_token(participant, None));
+        }
+        let response = request.send().await?;
         if response.status().is_success() {
             Ok(())
         } else {

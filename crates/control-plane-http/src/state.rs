@@ -73,7 +73,7 @@ impl AppState {
             config,
             settings,
             graph: Arc::new(graph),
-            callbacks: Callbacks::new(),
+            callbacks: Callbacks::new(dcp.clone()),
             dcp,
         })
     }

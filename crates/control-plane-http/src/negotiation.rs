@@ -460,14 +460,19 @@ pub async fn agree(state: Weak<AppState>, provider_pid: String) {
                 .agree(id, assigner, assignee, chrono::Utc::now())
                 .map_err(|e| e.to_string())?
                 .clone();
-            Ok::<_, String>((agreement, n.consumer_pid.clone(), callback))
+            Ok::<_, String>((
+                agreement,
+                n.consumer_pid.clone(),
+                callback,
+                n.participant_id.clone(),
+            ))
         })
     })
     .await;
     let Some(agreed) = agreed else {
         return;
     };
-    let (agreement, consumer_pid, callback) = match agreed {
+    let (agreement, consumer_pid, callback, participant) = match agreed {
         Ok(Some(Ok(agreed))) => agreed,
         Ok(Some(Err(reason))) => {
             tracing::warn!(%provider_pid, %reason, "not agreeing to negotiation");
@@ -479,7 +484,15 @@ pub async fn agree(state: Weak<AppState>, provider_pid: String) {
             return;
         }
     };
-    deliver_agreement(state, provider_pid, consumer_pid, callback, agreement).await;
+    deliver_agreement(
+        state,
+        provider_pid,
+        consumer_pid,
+        callback,
+        agreement,
+        participant,
+    )
+    .await;
 }
 
 /// How long the Provider waits before each new attempt to deliver an
@@ -520,6 +533,7 @@ async fn deliver_agreement(
     consumer_pid: String,
     callback: String,
     agreement: control_plane_core::common::Agreement,
+    participant: Option<String>,
 ) {
     // A clone, so that no strong handle on the app is held while waiting
     // on the Consumer.
@@ -530,7 +544,13 @@ async fn deliver_agreement(
     let mut delays = AGREEMENT_RETRY_DELAYS.iter();
     let sent = loop {
         let sent = callbacks
-            .send_agreement(&callback, &provider_pid, &consumer_pid, agreement.clone())
+            .send_agreement(
+                participant.as_deref(),
+                &callback,
+                &provider_pid,
+                &consumer_pid,
+                agreement.clone(),
+            )
             .await;
         let retryable = !matches!(sent, Ok(()) | Err(CallbackError::Unusable(_)));
         match delays.next() {
@@ -584,6 +604,7 @@ async fn deliver_agreement(
         // (a lost response, a timeout), so tell it the negotiation is over.
         if let Err(error) = callbacks
             .send_terminated(
+                participant.as_deref(),
                 &callback,
                 &provider_pid,
                 &consumer_pid,
@@ -611,14 +632,18 @@ pub async fn finalize(state: Weak<AppState>, provider_pid: String) {
         g.update_negotiation(&pid, |n| {
             n.transition(NegotiationState::Finalized)
                 .map_err(|e| e.to_string())?;
-            Ok::<_, String>((n.consumer_pid.clone(), n.callback_address.clone()))
+            Ok::<_, String>((
+                n.consumer_pid.clone(),
+                n.callback_address.clone(),
+                n.participant_id.clone(),
+            ))
         })
     })
     .await;
     let Some(finalized) = finalized else {
         return;
     };
-    let (consumer_pid, callback) = match finalized {
+    let (consumer_pid, callback, participant) = match finalized {
         Ok(Some(Ok(finalized))) => finalized,
         Ok(Some(Err(reason))) => {
             tracing::warn!(%provider_pid, %reason, "not finalizing negotiation");
@@ -635,7 +660,12 @@ pub async fn finalize(state: Weak<AppState>, provider_pid: String) {
         return;
     };
     if let Err(error) = callbacks
-        .send_finalized(&callback, &provider_pid, &consumer_pid)
+        .send_finalized(
+            participant.as_deref(),
+            &callback,
+            &provider_pid,
+            &consumer_pid,
+        )
         .await
     {
         tracing::warn!(%provider_pid, %callback, %error, "could not send the finalized event");
@@ -721,6 +751,7 @@ pub async fn resume(state: &Arc<AppState>) {
                     n.consumer_pid,
                     callback,
                     agreement,
+                    n.participant_id,
                 ));
             }
             (NegotiationState::Verified, _, _) => {
