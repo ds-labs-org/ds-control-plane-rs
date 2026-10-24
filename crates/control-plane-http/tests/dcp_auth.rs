@@ -743,3 +743,288 @@ async fn with_dcp_off_nothing_changes() {
     let (status, _) = cp.call("GET", "/cp/did.json", None, None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+// ---- binding to the authenticated participant ----
+
+/// Negotiates to FINALIZED as `consumer`; returns (providerPid, the
+/// Agreement as the Consumer received it).
+async fn finalized_agreement(cp: &ControlPlane, consumer: &Consumer) -> (String, Value) {
+    let consumer_pid = format!("urn:uuid:{}", uuid::Uuid::new_v4());
+    let (status, ack) = cp
+        .dsp(
+            consumer,
+            "POST",
+            "/negotiations/request",
+            Some(contract_request(
+                &consumer_pid,
+                Some(consumer.callback_address()),
+            )),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{ack}");
+    let provider_pid = ack["providerPid"].as_str().unwrap().to_string();
+    let received = wait_for_callbacks(consumer, 1).await;
+    let (path, _, message) = received.last().unwrap().clone();
+    assert_eq!(path, format!("/negotiations/{consumer_pid}/agreement"));
+    let agreement = message["agreement"].clone();
+
+    let (status, body) = cp
+        .dsp(
+            consumer,
+            "POST",
+            &format!("/negotiations/{provider_pid}/agreement/verification"),
+            Some(json!({
+                "@context": ["https://w3id.org/dspace/2025/1/context.jsonld"],
+                "@type": "ContractAgreementVerificationMessage",
+                "providerPid": provider_pid,
+                "consumerPid": consumer_pid,
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let received = wait_for_callbacks(consumer, 2).await;
+    assert_eq!(received[1].2["eventType"], "FINALIZED");
+    (provider_pid, agreement)
+}
+
+#[tokio::test]
+async fn the_agreement_is_granted_to_the_authenticated_did_and_opens_a_transfer() {
+    let issuer = Issuer::start().await;
+    let cp = ControlPlane::start(&[&issuer]).await;
+    let consumer = Consumer::with_credential(&issuer, MEMBERSHIP).await;
+
+    let (provider_pid, agreement) = finalized_agreement(&cp, &consumer).await;
+    assert_eq!(agreement["assignee"], consumer.did());
+    let stored = cp.graph.negotiation(&provider_pid).unwrap().unwrap();
+    assert_eq!(stored.participant_id.as_deref(), Some(consumer.did()));
+    let (status, ack) = cp
+        .dsp(
+            &consumer,
+            "GET",
+            &format!("/negotiations/{provider_pid}"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ack["state"], "FINALIZED");
+
+    let agreement_id = agreement["@id"].as_str().unwrap();
+    let (status, ack) = cp
+        .dsp(
+            &consumer,
+            "POST",
+            "/transfers/request",
+            Some(transfer_request("urn:uuid:ct1", agreement_id)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{ack}");
+    let transfer_pid = ack["providerPid"].as_str().unwrap();
+    let stored = cp.graph.transfer(transfer_pid).unwrap().unwrap();
+    assert_eq!(stored.participant_id.as_deref(), Some(consumer.did()));
+    let (status, _) = cp
+        .dsp(
+            &consumer,
+            "GET",
+            &format!("/transfers/{transfer_pid}"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn another_member_cannot_use_someone_elses_agreement_or_transfer() {
+    let issuer = Issuer::start().await;
+    let cp = ControlPlane::start(&[&issuer]).await;
+    let owner = Consumer::with_credential(&issuer, MEMBERSHIP).await;
+    let other = Consumer::with_credential(&issuer, MEMBERSHIP).await;
+
+    let (_, agreement) = finalized_agreement(&cp, &owner).await;
+    let agreement_id = agreement["@id"].as_str().unwrap();
+
+    let (status, body) = cp
+        .dsp(
+            &other,
+            "POST",
+            "/transfers/request",
+            Some(transfer_request("urn:uuid:other-t", agreement_id)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["@type"], "TransferError");
+    assert_eq!(cp.graph.transfers().unwrap().len(), 0);
+
+    let (status, ack) = cp
+        .dsp(
+            &owner,
+            "POST",
+            "/transfers/request",
+            Some(transfer_request("urn:uuid:owner-t", agreement_id)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{ack}");
+    let transfer_pid = ack["providerPid"].as_str().unwrap();
+    for (method, path) in [
+        ("GET", format!("/transfers/{transfer_pid}")),
+        ("POST", format!("/transfers/{transfer_pid}/termination")),
+        ("POST", format!("/transfers/{transfer_pid}/suspension")),
+        ("POST", format!("/transfers/{transfer_pid}/completion")),
+        ("POST", format!("/transfers/{transfer_pid}/start")),
+    ] {
+        let body = (method == "POST").then(|| {
+            json!({
+                "@context": ["https://w3id.org/dspace/2025/1/context.jsonld"],
+                "@type": "TransferTerminationMessage",
+                "providerPid": transfer_pid,
+                "consumerPid": "urn:uuid:owner-t",
+                "code": "x",
+            })
+        });
+        let (status, body) = cp.dsp(&other, method, &path, body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}: {body}");
+        assert_eq!(body["@type"], "TransferError");
+    }
+    let stored = cp.graph.transfer(transfer_pid).unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(stored.state).unwrap(),
+        json!("REQUESTED")
+    );
+}
+
+#[tokio::test]
+async fn another_member_cannot_act_on_someone_elses_negotiation() {
+    let issuer = Issuer::start().await;
+    let cp = ControlPlane::start(&[&issuer]).await;
+    let owner = Consumer::with_credential(&issuer, MEMBERSHIP).await;
+    let other = Consumer::with_credential(&issuer, MEMBERSHIP).await;
+
+    // No callback: the negotiation stays REQUESTED.
+    let (status, ack) = cp
+        .dsp(
+            &owner,
+            "POST",
+            "/negotiations/request",
+            Some(contract_request("urn:uuid:owner-n", None)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{ack}");
+    let pid = ack["providerPid"].as_str().unwrap();
+
+    let context = json!(["https://w3id.org/dspace/2025/1/context.jsonld"]);
+    let attempts = [
+        ("GET", format!("/negotiations/{pid}"), None),
+        (
+            "POST",
+            format!("/negotiations/{pid}/events"),
+            Some(json!({
+                "@context": context, "@type": "ContractNegotiationEventMessage",
+                "providerPid": pid, "consumerPid": "urn:uuid:owner-n", "eventType": "ACCEPTED",
+            })),
+        ),
+        (
+            "POST",
+            format!("/negotiations/{pid}/events"),
+            Some(json!({
+                "@context": context, "@type": "ContractNegotiationEventMessage",
+                "providerPid": pid, "consumerPid": "urn:uuid:owner-n", "eventType": "FINALIZED",
+            })),
+        ),
+        (
+            "POST",
+            format!("/negotiations/{pid}/agreement/verification"),
+            Some(json!({
+                "@context": context, "@type": "ContractAgreementVerificationMessage",
+                "providerPid": pid, "consumerPid": "urn:uuid:owner-n",
+            })),
+        ),
+        (
+            "POST",
+            format!("/negotiations/{pid}/request"),
+            Some(contract_request("urn:uuid:owner-n", None)),
+        ),
+        (
+            "POST",
+            format!("/negotiations/{pid}/termination"),
+            Some(json!({
+                "@context": context, "@type": "ContractNegotiationTerminationMessage",
+                "providerPid": pid, "consumerPid": "urn:uuid:owner-n", "code": "x",
+            })),
+        ),
+    ];
+    for (method, path, body) in attempts {
+        let (status, body) = cp.dsp(&other, method, &path, body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}: {body}");
+        assert_eq!(body["@type"], "ContractNegotiationError");
+        // The owner's consumerPid is not disclosed.
+        assert!(body.get("consumerPid").is_none_or(Value::is_null), "{body}");
+    }
+    let stored = cp.graph.negotiation(pid).unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(stored.state).unwrap(),
+        json!("REQUESTED")
+    );
+    // The owner still can.
+    let (status, _) = cp
+        .dsp(&owner, "GET", &format!("/negotiations/{pid}"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn an_agreement_made_without_dcp_grants_nothing_once_dcp_is_on() {
+    let issuer = Issuer::start().await;
+    let cp = ControlPlane::start(&[&issuer]).await;
+    let consumer = Consumer::with_credential(&issuer, MEMBERSHIP).await;
+    let mut n = control_plane_core::negotiation::ContractNegotiation::new(
+        "urn:uuid:old-n",
+        "urn:uuid:old-c",
+    );
+    n.state = control_plane_core::negotiation::NegotiationState::Finalized;
+    n.agreement = Some(control_plane_core::common::Agreement {
+        id: "urn:uuid:old-agreement".to_string(),
+        type_: "Agreement".to_string(),
+        target: "urn:uuid:control-plane-rs-seed-dataset".to_string(),
+        timestamp: chrono::Utc::now(),
+        assigner: "urn:connector:ds-control-plane-rs".to_string(),
+        assignee: "urn:uuid:old-c".to_string(),
+        permission: vec![],
+        prohibition: vec![],
+        obligation: vec![],
+    });
+    cp.graph.put_negotiation(&n).unwrap();
+    let (status, _) = cp
+        .dsp(
+            &consumer,
+            "POST",
+            "/transfers/request",
+            Some(transfer_request("urn:uuid:t", "urn:uuid:old-agreement")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = cp
+        .dsp(&consumer, "GET", "/negotiations/urn:uuid:old-n", None)
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn with_dcp_off_the_assignee_is_still_the_consumer_pid() {
+    let cp = ControlPlane::start_unauthenticated().await;
+    let consumer = Consumer::start().await;
+    let (status, ack) = cp
+        .call(
+            "POST",
+            &format!("{DSP}/negotiations/request"),
+            None,
+            Some(contract_request(
+                "urn:uuid:c-off",
+                Some(consumer.callback_address()),
+            )),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{ack}");
+    let received = wait_for_callbacks(&consumer, 1).await;
+    assert_eq!(received[0].2["agreement"]["assignee"], "urn:uuid:c-off");
+    // No token on callbacks without DCP.
+    assert_eq!(received[0].1, None);
+}
