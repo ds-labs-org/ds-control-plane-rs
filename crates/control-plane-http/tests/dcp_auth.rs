@@ -1028,3 +1028,85 @@ async fn with_dcp_off_the_assignee_is_still_the_consumer_pid() {
     // No token on callbacks without DCP.
     assert_eq!(received[0].1, None);
 }
+
+// ---- callbacks ----
+
+/// Checks a callback's `Authorization` header: a Self-Issued ID Token of
+/// the control plane (signature by the key its served DID document lists
+/// for capabilityInvocation), addressed to `audience`.
+async fn assert_control_plane_token(
+    cp: &ControlPlane,
+    authorization: Option<&str>,
+    audience: &str,
+) {
+    let token = authorization
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .expect("the callback carries a bearer token");
+    let (_, header, claims) = decode_jws_unverified(token).unwrap();
+    let kid = header["kid"].as_str().unwrap();
+    let doc = resolve_did(&reqwest::Client::new(), &cp.did, true)
+        .await
+        .unwrap();
+    verify_jws_signature(token, &find_verifying_key(&doc, kid).unwrap()).unwrap();
+    assert!(doc.capability_invocation.iter().any(|k| k == kid));
+    assert_eq!(claims["iss"], cp.did);
+    assert_eq!(claims["sub"], cp.did);
+    assert_eq!(claims["aud"], audience);
+    assert!(claims["exp"].as_u64().unwrap() > now_secs());
+    assert!(claims["jti"].is_string());
+}
+
+#[tokio::test]
+async fn callbacks_carry_a_token_the_consumer_can_verify() {
+    let issuer = Issuer::start().await;
+    let cp = ControlPlane::start(&[&issuer]).await;
+    let consumer = Consumer::with_credential(&issuer, MEMBERSHIP).await;
+    finalized_agreement(&cp, &consumer).await;
+    let received = consumer.callbacks();
+    assert_eq!(received.len(), 2);
+    for (_, authorization, _) in &received {
+        assert_control_plane_token(&cp, authorization.as_deref(), consumer.did()).await;
+    }
+    assert_ne!(
+        received[0].1, received[1].1,
+        "each callback has its own token"
+    );
+}
+
+/// An AGREED negotiation a restart interrupted is resumed: the Agreement
+/// is sent again, still to the authenticated participant and with a token
+/// addressed to it.
+#[tokio::test]
+async fn a_resumed_negotiation_keeps_its_participant() {
+    let issuer = Issuer::start().await;
+    let consumer = Consumer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let graph = control_plane_graph::ControlPlaneGraph::open(dir.path()).unwrap();
+        let mut n = control_plane_core::negotiation::ContractNegotiation::new(
+            "urn:uuid:resumed",
+            "urn:uuid:resumed-c",
+        );
+        n.offer = Some(
+            serde_json::from_value(json!({
+                "@id": "urn:uuid:control-plane-rs-seed-offer",
+                "@type": "Offer",
+                "target": "urn:uuid:control-plane-rs-seed-dataset",
+                "permission": [{"action": "use"}]
+            }))
+            .unwrap(),
+        );
+        n.callback_address = Some(consumer.callback_address());
+        n.participant_id = Some(consumer.did().to_string());
+        graph.put_negotiation(&n).unwrap();
+    }
+    let store = dir.path().to_path_buf();
+    let cp = ControlPlane::start_with(&[&issuer], |config| {
+        config.store_path = Some(store);
+    })
+    .await;
+    let received = wait_for_callbacks(&consumer, 1).await;
+    assert_eq!(received[0].0, "/negotiations/urn:uuid:resumed-c/agreement");
+    assert_eq!(received[0].2["agreement"]["assignee"], consumer.did());
+    assert_control_plane_token(&cp, received[0].1.as_deref(), consumer.did()).await;
+}
