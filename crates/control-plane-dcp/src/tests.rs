@@ -190,7 +190,11 @@ fn trusted_issuer_hosts_are_reachable_but_nothing_else_by_default() {
     let mut config = DcpConfig::new("did:web:cp.example");
     config.trusted_issuers = vec!["did:web:issuer.example%3A9000:i".to_string()];
     let dcp = Dcp::new(config).unwrap();
-    assert!(dcp.outbound().check_did("did:web:issuer.example", false).is_ok());
+    assert!(
+        dcp.outbound()
+            .check_did("did:web:issuer.example", false)
+            .is_ok()
+    );
     assert!(
         dcp.outbound()
             .check_did("did:web:consumer.example", false)
@@ -407,7 +411,10 @@ async fn a_did_outside_the_allow_list_is_never_resolved() {
     let f = fixture().await;
     let outsider = DcpKeyPair::generate(format!(
         "did:web:{}:consumer",
-        f.server.host.replace("127.0.0.1", "localhost").replace(':', "%3A")
+        f.server
+            .host
+            .replace("127.0.0.1", "localhost")
+            .replace(':', "%3A")
     ));
     let error = f
         .dcp
@@ -446,7 +453,10 @@ fn credential_claims_name_issuer_and_types() {
     )
     .unwrap();
     assert_eq!(claims.issuer, "did:web:issuer");
-    assert_eq!(claims.types, ["VerifiableCredential", "MembershipCredential"]);
+    assert_eq!(
+        claims.types,
+        ["VerifiableCredential", "MembershipCredential"]
+    );
 }
 
 #[test]
