@@ -105,6 +105,11 @@ pub struct ContractNegotiation {
     /// `ContractRequestMessage`). `None` means this Provider has no way to
     /// reach the Consumer, so it never moves the negotiation on by itself.
     pub callback_address: Option<String>,
+    /// The DID of the participant DCP authenticated when this negotiation
+    /// was requested: its Agreement's `assignee`, and the only participant
+    /// whose later messages on it are accepted. `None` when the request was
+    /// not authenticated (DCP off).
+    pub participant_id: Option<String>,
 }
 
 impl ContractNegotiation {
@@ -117,6 +122,7 @@ impl ContractNegotiation {
             offer: None,
             agreement: None,
             callback_address: None,
+            participant_id: None,
         }
     }
 

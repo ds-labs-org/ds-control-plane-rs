@@ -781,3 +781,80 @@ fn a_new_negotiation_is_never_evicted_by_its_own_write() {
     assert!(graph.negotiation("urn:uuid:fresh").unwrap().is_some());
     assert!(graph.negotiation("urn:uuid:finalized0").unwrap().is_none());
 }
+
+/// The DCP-authenticated participant a negotiation or transfer is bound to
+/// is stored with it, and an unauthenticated one (auth off) reads back as
+/// `None`.
+#[test]
+fn the_authenticated_participant_round_trips() {
+    let graph = ControlPlaneGraph::open_in_memory().unwrap();
+    let mut n = negotiation();
+    n.participant_id = Some("did:web:consumer.example".to_string());
+    graph.put_negotiation(&n).unwrap();
+    let back = graph.negotiation("urn:uuid:n1").unwrap().unwrap();
+    assert_eq!(
+        back.participant_id.as_deref(),
+        Some("did:web:consumer.example")
+    );
+    graph
+        .update_negotiation("urn:uuid:n1", |n| n.transition(NegotiationState::Agreed))
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let back = graph.negotiation("urn:uuid:n1").unwrap().unwrap();
+    assert_eq!(
+        back.participant_id.as_deref(),
+        Some("did:web:consumer.example")
+    );
+
+    let mut t = TransferProcess::new("urn:uuid:t1", "urn:uuid:c1", "urn:uuid:a", "HttpData-PULL");
+    t.participant_id = Some("did:web:consumer.example".to_string());
+    graph.put_transfer(&t).unwrap();
+    let back = graph.transfer("urn:uuid:t1").unwrap().unwrap();
+    assert_eq!(
+        back.participant_id.as_deref(),
+        Some("did:web:consumer.example")
+    );
+
+    graph
+        .put_negotiation(&ContractNegotiation::new("urn:uuid:n2", "urn:uuid:c2"))
+        .unwrap();
+    assert_eq!(
+        graph
+            .negotiation("urn:uuid:n2")
+            .unwrap()
+            .unwrap()
+            .participant_id,
+        None
+    );
+    graph
+        .put_transfer(&TransferProcess::new("urn:uuid:t2", "c", "a", "f"))
+        .unwrap();
+    assert_eq!(
+        graph
+            .transfer("urn:uuid:t2")
+            .unwrap()
+            .unwrap()
+            .participant_id,
+        None
+    );
+}
+
+/// Evicting a negotiation bound to a participant leaves nothing of it
+/// behind.
+#[test]
+fn eviction_removes_the_participant_too() {
+    let graph = ControlPlaneGraph::open_in_memory().unwrap();
+    for i in 0..=MAX_NEGOTIATIONS {
+        let mut n = ContractNegotiation::new(format!("urn:uuid:p{i}"), "urn:uuid:c");
+        n.participant_id = Some(format!("did:web:p{i}.example"));
+        graph.put_negotiation(&n).unwrap();
+    }
+    assert!(graph.negotiation("urn:uuid:p0").unwrap().is_none());
+    let gone = oxigraph::model::Literal::new_simple_literal("did:web:p0.example");
+    let hits = graph
+        .store
+        .quads_for_pattern(None, None, Some(gone.as_ref().into()), None)
+        .count();
+    assert_eq!(hits, 0);
+}

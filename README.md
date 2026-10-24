@@ -19,8 +19,12 @@ transfer-process surfaces of a dataspace [=Connector=], as defined by the
 This project implements the **control plane** side of that split: the
 message-passing state machines and their HTTP surface. It does not
 implement a data plane (no wire-protocol data transfer of its own — see
-sibling project `ds-sql-dps-rs` for a Data Plane Signaling driver) or the
-identity/credential (DCP) side of a connector.
+sibling project `ds-sql-dps-rs` for a Data Plane Signaling driver) or a
+DCP Credential Service. It is a DCP **verifier**: with DCP configured it
+authenticates every DSP request (a Self-Issued ID Token plus credentials
+fetched from the counterparty's Credential Service, e.g.
+`ds-identity-hub-rs`) and binds agreements and transfers to the
+authenticated participant.
 
 ## Scope
 
@@ -45,6 +49,13 @@ a real, date-stamped Eclipse Dataspace TCK conformance snapshot.
   `TransferProcess` state machine matching the spec's state descriptions.
   A transfer needs an agreement this connector has finalized. No data
   plane wiring.
+- **Authentication (DCP)**: optional. Off (the default, and how the DSP
+  TCK runs), the DSP endpoints are unauthenticated and the server logs a
+  warning saying so. On, every catalog, negotiation and transfer request
+  needs a valid token and valid credentials (401 otherwise), the
+  Agreement's `assignee` is the counterparty's DID, and only that
+  participant may act on its negotiations, agreements and transfers (403
+  otherwise). See "DCP authentication" in `ARCHITECTURE.md`.
 - **Policy**: an always-allow stub — the provider agrees to every offer,
   with no ODRL constraint evaluation.
 - **Consumer role**: out of scope for this pass (no consumer HTTP surface,
@@ -61,6 +72,11 @@ crates/
                         identity, catalog datasets and ODRL offers) and the
                         runtime graph (negotiations, transfer processes),
                         in memory or persisted with RocksDB.
+  control-plane-dcp/    DCP verifier: Self-Issued ID Token checks, the
+                        presentation query to the counterparty's
+                        Credential Service and the VP/VC checks, the
+                        outbound host allow-list, and the control plane's
+                        own did:web identity.
   control-plane-contreforts/
                         Contreforts connector over that store, with its
                         SHACL-validated declaration.ttl.
@@ -100,6 +116,20 @@ Configuration is via environment variables (`crates/control-plane-http/src/confi
 store, so the catalog and every negotiation and transfer process survive a
 restart. Unset, everything is kept in memory.
 
+DCP authentication is configured with:
+
+| Variable | Meaning |
+|---|---|
+| `DCP_DID` | This connector's `did:web` DID. Unset: DCP is off and the DSP endpoints are unauthenticated. Its DID document is served, without a token, at the path the DID resolves to (`did:web:cp.example.com:dsp` -> `/dsp/did.json`, `did:web:cp.example.com` -> `/.well-known/did.json`). |
+| `DCP_KEY_FILE` | Its P-256 private key: a PKCS#8 or SEC1 PEM, or an EC JWK with `d`. Unset: a key is generated at startup, with a warning (it changes on every restart). |
+| `DCP_TRUSTED_ISSUERS` | Comma-separated issuer DIDs whose credentials are accepted. Unset or empty trusts nobody, so every request is refused. |
+| `DCP_REQUIRED_SCOPES` | Scopes the counterparty must present credentials for, comma- or space-separated, each `org.eclipse.dspace.dcp.vc.type:<Type>[:<suffix>]`. Default `org.eclipse.dspace.dcp.vc.type:MembershipCredential:read`. |
+| `DCP_ALLOWED_HOSTS` | Comma-separated hosts the verifier may contact to resolve counterparty DIDs and query their Credential Services (the trusted issuers' hosts are added). Unset allows none. |
+| `DCP_INSECURE_HTTP` | `true` resolves `did:web` over `http` and accepts `http` Credential Services. Tests and local setups only. |
+
+Setting any other `DCP_*` variable without `DCP_DID`, or an unusable
+value, stops startup rather than silently running unauthenticated.
+
 ### Dataspace Protocol TCK conformance
 
 `crates/control-plane-http/tests/dsp_tck.rs` runs the real, official
@@ -108,7 +138,7 @@ restart. Unset, everything is kept in memory.
 in-process instance of this server — not a mock, and not a
 reimplementation of the TCK's own assertions. It is `#[ignore]`d by default
 (requires Docker) so plain `cargo test` and the fast CI job stay
-Docker-free:
+Docker-free. The TCK cannot mint DCP tokens, so it runs with DCP off:
 
 ```bash
 cargo test -p control-plane-http --test dsp_tck -- --ignored --nocapture

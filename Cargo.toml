@@ -5,6 +5,7 @@ members = [
     "crates/control-plane-graph",
     "crates/control-plane-contreforts",
     "crates/control-plane-http",
+    "crates/control-plane-dcp",
     "vendor/contreforts-core",
 ]
 
@@ -29,6 +30,15 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
 axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# DCP primitives (compact JWS ES256, did:web resolution, DID documents),
+# used by crates/control-plane-dcp. Pinned at the same commit
+# ds-identity-hub-rs uses, so the two interoperate on identical code.
+# It pulls in p256 0.13 and so sha2 0.10; control-plane-graph's own
+# `sha2 = "0.11"` keeps oxigraph's digest-0.11 sha2 in the build next to it.
+ds-dcp-core-rs = { git = "https://github.com/ds-labs-org/ds-dcp-core-rs", rev = "78ef8d0e25f496a6674fd916939c690af4735023" }
+p256 = { version = "0.13", features = ["ecdsa", "pem"] }
 
 # Contreforts-backed semantic storage (crates/control-plane-graph,
 # crates/control-plane-contreforts). Versions match ds-identity-hub-rs and

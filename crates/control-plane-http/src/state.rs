@@ -7,6 +7,7 @@ use std::sync::{Arc, Weak};
 
 use control_plane_core::catalog::{Catalog, DataService, Dataset, Distribution};
 use control_plane_core::common::{Offer, Rule};
+use control_plane_dcp::Dcp;
 use control_plane_graph::{ConnectorSettings, ControlPlaneGraph, GraphError};
 
 use crate::callback::Callbacks;
@@ -30,6 +31,10 @@ pub struct AppState {
     pub graph: Arc<ControlPlaneGraph>,
     /// Sends this Provider's messages to Consumers' callback addresses.
     pub callbacks: Callbacks,
+    /// DCP authentication of counterparties (`config.dcp`), with this
+    /// connector's own DCP identity. `None`: DSP endpoints are
+    /// unauthenticated.
+    pub dcp: Option<Arc<Dcp>>,
 }
 
 impl AppState {
@@ -41,7 +46,14 @@ impl AppState {
     /// comes from `config` — it describes this deployment — and is
     /// rewritten on every start; the catalog lives only in the settings
     /// graph and is never overwritten once present.
-    pub fn open(config: Config) -> Result<Self, GraphError> {
+    ///
+    /// With `config.dcp`, also loads (or generates) this connector's DCP
+    /// signing key; an unusable DCP configuration is an error.
+    pub fn open(config: Config) -> anyhow::Result<Self> {
+        let dcp = match &config.dcp {
+            Some(dcp) => Some(Arc::new(Dcp::new(dcp.clone())?)),
+            None => None,
+        };
         let graph = match &config.store_path {
             Some(path) => ControlPlaneGraph::open(path)?,
             None => ControlPlaneGraph::open_in_memory()?,
@@ -61,7 +73,8 @@ impl AppState {
             config,
             settings,
             graph: Arc::new(graph),
-            callbacks: Callbacks::new(),
+            callbacks: Callbacks::new(dcp.clone()),
+            dcp,
         })
     }
 

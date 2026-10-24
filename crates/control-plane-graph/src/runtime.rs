@@ -108,6 +108,11 @@ fn write_negotiation(
         dspace("callbackAddress"),
         n.callback_address.as_deref(),
     );
+    w.add_opt_str(
+        node.clone(),
+        dscp("participantDid"),
+        n.participant_id.as_deref(),
+    );
     if let Some(offer) = &n.offer {
         write_offer(&mut w, node.clone(), dspace("offer"), 0, offer);
     }
@@ -140,6 +145,7 @@ fn read_negotiation(
             offer,
             agreement,
             callback_address: r.opt_str(s, &dspace("callbackAddress"))?,
+            participant_id: r.opt_str(s, &dscp("participantDid"))?,
         },
         modified: r.date_time(s, &dcterms("modified"))?,
     })
@@ -156,6 +162,11 @@ fn write_transfer(
     w.add(node.clone(), dspace("state"), state_iri(t.state));
     w.add_str(node.clone(), dspace("agreementId"), &t.agreement_id);
     w.add_str(node.clone(), dcterms("format"), &t.format);
+    w.add_opt_str(
+        node.clone(),
+        dscp("participantDid"),
+        t.participant_id.as_deref(),
+    );
     w.add_date_time(node.clone(), dcterms("modified"), Utc::now());
     Ok((node, w.quads))
 }
@@ -169,6 +180,7 @@ fn read_transfer(r: &Reader<'_>, node: &NamedNode) -> Result<Record<TransferProc
             state: read_state::<TransferState>(r, s)?,
             agreement_id: r.str(s, &dspace("agreementId"))?,
             format: r.str(s, &dcterms("format"))?,
+            participant_id: r.opt_str(s, &dscp("participantDid"))?,
         },
         modified: r.date_time(s, &dcterms("modified"))?,
     })

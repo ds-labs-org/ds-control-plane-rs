@@ -35,8 +35,8 @@ conformance suite:
 This project implements a **connector control plane**: the message
 handling and state machines behind those four surfaces. It is not a data
 plane (see sibling project [`ds-sql-dps-rs`](https://github.com/ds-labs-org/ds-sql-dps-rs)
-for a Data Plane Signaling driver) and not the identity/credential (DCP)
-side of a connector.
+for a Data Plane Signaling driver) and not a DCP Credential Service. It
+is a DCP verifier: see "DCP authentication" below.
 
 ## Scope
 
@@ -115,8 +115,9 @@ side of a connector.
   sends an `AGREED` negotiation's Agreement again (terminating as above
   if that fails), and finalizes `VERIFIED` ones. Callbacks
   (`crates/control-plane-http/src/callback.rs`) never follow redirects and
-  give up after 10 s; since the Consumer is not authenticated yet, the
-  callback address is whatever the requester sent.
+  give up after 10 s. The callback address is whatever the requester
+  sent; with DCP on that requester is authenticated, and each callback
+  carries a token the Consumer can verify (see "DCP authentication").
 
 ### Stubbed
 
@@ -132,9 +133,12 @@ side of a connector.
   an Offer, a Consumer counter-request (`POST
   /negotiations/:providerPid/request`) is refused with a 400
   `ContractNegotiationError`: the spec allows one only from `OFFERED`.
-- **Agreement assignee**: there is no DCP yet, so the Consumer has no
-  verified participant id; the Agreement's `assignee` is its
-  `consumerPid`.
+- **Agreement assignee with DCP off**: without DCP the Consumer has no
+  verified participant id, so the Agreement's `assignee` is its
+  `consumerPid` and nothing binds an agreement to a participant: anyone
+  who learns a finalized agreement id can open a transfer under it. With
+  DCP on, the `assignee` is the authenticated DID and only that
+  participant can use it (see "DCP authentication").
 - **Catalog seeding**: a fresh settings graph is seeded with exactly one
   dataset id (`urn:uuid:control-plane-rs-seed-dataset`); more can be added
   only through the Contreforts connector (there is no management HTTP API
@@ -162,8 +166,111 @@ side of a connector.
   — only the flat, atomic `leftOperand`/`operator`/`rightOperand` shape is
   modeled.
 - **Pagination, filtering, compression** on the catalog endpoint.
-- **Authorization**: the `Authorization` header is accepted but never
-  checked.
+- **Authentication with DCP off** (the default, and how the DSP TCK runs,
+  since the TCK cannot mint DCP tokens): the `Authorization` header is
+  ignored and startup logs a warning that the DSP endpoints are
+  unauthenticated. With DCP on, see "DCP authentication" for what is
+  checked and its known gaps.
+
+## DCP authentication
+
+**2026-10-24.** With `DCP_DID` set (see README for the `DCP_*`
+variables), the control plane authenticates the counterparty of every
+DSP request with the [Decentralized Claims Protocol](https://github.com/eclipse-dataspace-dcp/decentralized-claims-protocol),
+as a verifier, and interoperates with
+[`ds-identity-hub-rs`](https://github.com/ds-labs-org/ds-identity-hub-rs)
+as the Consumer's Credential Service. The verifier lives in
+`crates/control-plane-dcp` (no axum), ported from the hub's `auth.rs`,
+`outbound.rs`, `validation.rs` and `SeenJtiCache`, on `ds-dcp-core-rs`
+pinned at the hub's rev (`78ef8d0`). `ds-dcp-core-rs` brings `p256` 0.13
+and so `sha2`/`digest` 0.10, next to oxigraph's 0.11, which
+`control-plane-graph`'s `sha2 = "0.11"` guard keeps in the build.
+
+**What a request must carry.** `Authorization: Bearer <SI token>`, a
+Self-Issued ID Token the Consumer signed (ES256) with a key of its
+`did:web` DID. `Dcp::verify_self_issued_token` checks, in this order: the
+DID's host is on the outbound allow-list (before anything is fetched),
+the resolved DID document has the `kid`'s key and lists it under
+`capabilityInvocation`, the signature, `iss == sub`, `aud` names the
+control plane's DID (a string or a list), `exp`, `nbf`/`iat` not in the
+future (30 s leeway), and `jti`, which is required (the hub accepts a
+token without one; replay protection needs it) and refused when seen
+before (a capped cache of 16384). Its `token` claim, the Consumer's
+access token for its own Credential Service, is required too.
+
+**Credentials.** `Dcp::verify_credentials` takes the `CredentialService`
+endpoint from the Consumer's DID document (on the allow-list, `https`
+unless `DCP_INSECURE_HTTP`), and sends `POST {endpoint}/presentations/query`
+with `Authorization: Bearer <the control plane's own SI token>` (`iss` =
+`sub` = its DID, `aud` the Consumer's DID, the Consumer's access token
+forwarded as is as `token`) and a `PresentationQueryMessage` with the
+required `scope`. The message carries `type`, not `@type` as
+`dcp_core::PresentationQueryMessage` serializes it: the hub's
+`presentation_query` requires `type`, so the body is built here. The
+answer (at most 1 MiB, no redirects, 10 s timeout) must hold at least one
+JWT VP, and every one is checked: signed by a key of the Consumer's DID
+document, `iss` the Consumer, `aud` the control plane, not expired, its
+`holder` (if any) the Consumer. Every JWT VC in it is checked too, and
+one failing fails the request: its issuer (`iss`, agreeing with
+`vc.issuer`) on `DCP_TRUSTED_ISSUERS` before its DID is resolved (an
+empty list trusts nobody), its signature by a key of the issuer's DID
+document, its subject (`sub` and `credentialSubject.id`) the Consumer,
+not expired (`exp`, `expirationDate`), already valid (`nbf`,
+`issuanceDate`, `validFrom`). Each required scope
+`org.eclipse.dspace.dcp.vc.type:<Type>[:<suffix>]` needs a verified
+credential of type `<Type>`. The hosts of trusted issuers are added to
+`DCP_ALLOWED_HOSTS`; counterparties' hosts must be listed.
+
+**Where it applies.** A route layer (`crates/control-plane-http/src/auth.rs`)
+on every catalog, negotiation and transfer route runs both checks before
+the body is read; a failure is a 401 with the protocol's own error body
+(`CatalogError`, `ContractNegotiationError` with the path's
+`providerPid` or a minted one, `TransferError`) and
+`WWW-Authenticate: Bearer`. `/.well-known/dspace-version` and the DID
+document are public. The control plane's DID document (one
+`JsonWebKey2020` P-256 key under `authentication`, `assertionMethod` and
+`capabilityInvocation`, no services) is served at the path its did:web
+resolves to. Its key comes from `DCP_KEY_FILE` (PKCS#8 or SEC1 PEM, or a
+JWK) or is generated at startup with a warning.
+
+**Binding.** The authenticated DID is stored on the negotiation and on
+the transfer (`dscp:participantDid` in the runtime graph). The
+Agreement's `assignee` is that DID. Every later message on a negotiation
+(GET, events, verification, counter-request, termination) and on a
+transfer (GET, start, completion, suspension, termination) must come
+from the same participant, checked inside the same store write, or it is
+a 403 that does not disclose the owner's `consumerPid`. A transfer
+request needs a finalized agreement whose `assignee` is the caller: 403
+`TransferError` otherwise (400 as before when there is no finalized
+agreement with that id). A record made with DCP off is bound to no one,
+so once DCP is on nobody may use it. Callbacks to the Consumer carry
+`Authorization: Bearer <SI token of the control plane, aud the
+participant's DID>`, fresh per request, also when `negotiation::resume`
+sends them after a restart. With DCP off none of this applies and
+behaviour is as before.
+
+**Tests.** `crates/control-plane-dcp/src/tests.rs` (token checks against
+a stand-in did:web server, outbound policy, jti cache, key loading,
+credential claim checks) and `crates/control-plane-http/tests/dcp_auth.rs`
+(stand-in consumer DID, Credential Service checking the control plane's
+token as the hub does, callback receiver and issuers on loopback: each
+401 case, the full flow to FINALIZED and a 201 transfer, the 403s for
+another participant, callbacks' tokens, resume, DCP off).
+
+**Known gaps.** Not run against a real `ds-identity-hub-rs` or EDC
+deployment, only against stand-ins that mirror the hub's checks and
+shapes. Only `did:web`. Only JWT VCs and VPs (VC data model 1.1 `vc`/`vp`
+claims; no VC data model 2.0 / JOSE-COSE envelopes, no Linked Data
+proofs). Only `scope`, no `presentationDefinition`. No revocation or
+status list checks (`credentialStatus` is ignored). No trust registry: a
+trusted issuer is trusted for every credential type. A DID document's
+`id` is not compared with the DID (`dcp_core::DidDocument` does not read
+it), and VP/VC keys need only be in `verificationMethod`, not under
+`assertionMethod`. Nothing is cached: each DSP request resolves the
+Consumer's DID, queries its Credential Service and resolves each issuer's
+DID. The control plane offers no Credential Service of its own, so its
+callbacks carry no `token` claim for the Consumer to query it with. The
+jti cache is in memory and capped, so it forgets on restart.
 
 ## Contreforts: settings and runtime persistence
 
@@ -199,7 +306,9 @@ separates configuration from synced data:
   contract negotiation and transfer process, named by its `providerPid`,
   typed `dspace:ContractNegotiation`/`dspace:TransferProcess`, with its
   state as the real DSP state IRI (`dspace:REQUESTED`, ...), the offer and
-  agreement as ODRL nodes, and a `dcterms:modified` timestamp.
+  agreement as ODRL nodes, the DCP-authenticated participant
+  (`dscp:participantDid`, absent with DCP off), and a `dcterms:modified`
+  timestamp.
 
 Vocabulary is real DSP (`https://w3id.org/dspace/2025/1/`), DCAT, Dublin
 Core and ODRL wherever a term exists, plus this project's own
@@ -336,7 +445,9 @@ executed.
 (Re-run on 2026-10-17 after the provider started retrying an undelivered
 Agreement and telling the Consumer when it then terminates, which made
 `CN:02-01` pass; the 2026-10-16 run had 11 passed, and the 2026-09-19 run
-8, with only `CN:02-02` in `CN`.)
+8, with only `CN:02-02` in `CN`. Re-run on 2026-10-24 after DCP
+authentication was added, with DCP off as the TCK requires: the same 65
+run, 12 passed, 53 failed, exactly the documented set.)
 
 | Group | Total | Passed | Failed | Notes |
 |-------|------:|-------:|-------:|-------|
