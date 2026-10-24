@@ -86,6 +86,9 @@ impl Issuer {
 
 // ---- consumers ----
 
+/// A callback the Consumer received: (path, Authorization header, body).
+type Callback = (String, Option<String>, Value);
+
 #[derive(Clone)]
 struct Consumer {
     key: DcpKeyPair,
@@ -95,7 +98,7 @@ struct Consumer {
     /// Every presentation query that passed the token checks.
     queries: Arc<Mutex<Vec<Value>>>,
     /// Every callback: (path, Authorization header, body).
-    callbacks: Arc<Mutex<Vec<(String, Option<String>, Value)>>>,
+    callbacks: Arc<Mutex<Vec<Callback>>>,
 }
 
 impl Consumer {
@@ -176,7 +179,7 @@ impl Consumer {
         self.sign(&self.claims(audience))
     }
 
-    fn callbacks(&self) -> Vec<(String, Option<String>, Value)> {
+    fn callbacks(&self) -> Vec<Callback> {
         self.callbacks.lock().unwrap().clone()
     }
 }
@@ -448,7 +451,7 @@ fn transfer_request(consumer_pid: &str, agreement_id: &str) -> Value {
 }
 
 /// Waits until `consumer` has received `n` callbacks.
-async fn wait_for_callbacks(consumer: &Consumer, n: usize) -> Vec<(String, Option<String>, Value)> {
+async fn wait_for_callbacks(consumer: &Consumer, n: usize) -> Vec<Callback> {
     for _ in 0..200 {
         let received = consumer.callbacks();
         if received.len() >= n {
