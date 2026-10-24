@@ -820,14 +820,22 @@ fn the_authenticated_participant_round_trips() {
         .put_negotiation(&ContractNegotiation::new("urn:uuid:n2", "urn:uuid:c2"))
         .unwrap();
     assert_eq!(
-        graph.negotiation("urn:uuid:n2").unwrap().unwrap().participant_id,
+        graph
+            .negotiation("urn:uuid:n2")
+            .unwrap()
+            .unwrap()
+            .participant_id,
         None
     );
     graph
         .put_transfer(&TransferProcess::new("urn:uuid:t2", "c", "a", "f"))
         .unwrap();
     assert_eq!(
-        graph.transfer("urn:uuid:t2").unwrap().unwrap().participant_id,
+        graph
+            .transfer("urn:uuid:t2")
+            .unwrap()
+            .unwrap()
+            .participant_id,
         None
     );
 }
