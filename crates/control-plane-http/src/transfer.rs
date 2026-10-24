@@ -5,10 +5,10 @@
 
 use std::sync::Arc;
 
-use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use axum::{Extension, Json};
 use control_plane_core::transfer::{
     TransferCompletionMessage, TransferErrorMessage, TransferProcess, TransferRequestMessage,
     TransferStartMessage, TransferState, TransferSuspensionMessage, TransferTerminationMessage,
@@ -16,6 +16,7 @@ use control_plane_core::transfer::{
 
 use control_plane_graph::GraphError;
 
+use crate::auth::Participant;
 use crate::state::AppState;
 
 fn store_error(
@@ -48,6 +49,21 @@ fn not_found(provider_pid: &str) -> impl IntoResponse {
     )
 }
 
+/// A 403: the transfer process (or the agreement it names) belongs to
+/// another participant.
+fn forbidden(provider_pid: &str, reason: &str) -> axum::response::Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(TransferErrorMessage::new(
+            Some(provider_pid.to_string()),
+            None,
+            "403",
+            reason,
+        )),
+    )
+        .into_response()
+}
+
 fn bad_transition(
     provider_pid: &str,
     consumer_pid: &str,
@@ -68,41 +84,66 @@ fn bad_transition(
 /// `GET {dsp}/transfers/:providerPid`.
 pub async fn get_transfer(
     State(state): State<Arc<AppState>>,
+    Extension(participant): Extension<Participant>,
     Path(provider_pid): Path<String>,
 ) -> impl IntoResponse {
     let lookup = provider_pid.clone();
     match state.with_graph(move |g| g.transfer(&lookup)).await {
+        Ok(Some(t)) if !participant.may_act_on(t.participant_id.as_deref()) => {
+            forbidden(&provider_pid, OTHER_PARTICIPANT)
+        }
         Ok(Some(t)) => (StatusCode::OK, Json(t.to_ack())).into_response(),
         Ok(None) => not_found(&provider_pid).into_response(),
         Err(e) => store_error(Some(&provider_pid), None, e),
     }
 }
 
+const OTHER_PARTICIPANT: &str = "the transfer process belongs to another participant";
+
+/// What [`initiate_transfer`] found for the requested agreement.
+enum Grant {
+    /// Finalized and granted to the caller: the transfer was stored.
+    Granted,
+    /// No finalized agreement with that id.
+    NoAgreement,
+    /// Finalized, but granted to another participant.
+    OtherAssignee,
+}
+
 /// `POST {dsp}/transfers/request` — accepted only under an `agreementId`
 /// this connector has finalized a negotiation for
 /// ([`ControlPlaneGraph::agreement`](control_plane_graph::ControlPlaneGraph::agreement));
-/// any other is a `TransferError` 400.
+/// any other is a `TransferError` 400. With DCP on, the agreement's
+/// `assignee` must also be the authenticated participant, or it is a 403;
+/// the transfer is then bound to that participant.
 pub async fn initiate_transfer(
     State(state): State<Arc<AppState>>,
+    Extension(participant): Extension<Participant>,
     Json(msg): Json<TransferRequestMessage>,
 ) -> impl IntoResponse {
     let provider_pid = format!("urn:uuid:{}", uuid::Uuid::new_v4());
-    let transfer = TransferProcess::new(
+    let mut transfer = TransferProcess::new(
         provider_pid,
         msg.consumer_pid.clone(),
         msg.agreement_id,
         msg.format,
     );
+    transfer.participant_id = participant.0.clone();
     let stored = transfer.clone();
     let result = state
         .with_graph(move |g| match g.agreement(&stored.agreement_id)? {
-            Some(_) => g.put_transfer(&stored).map(|()| true),
-            None => Ok(false),
+            Some(a) if !participant.may_act_on(Some(&a.assignee)) => Ok(Grant::OtherAssignee),
+            Some(_) => g.put_transfer(&stored).map(|()| Grant::Granted),
+            None => Ok(Grant::NoAgreement),
         })
         .await;
     match result {
-        Ok(true) => (StatusCode::CREATED, Json(transfer.to_ack())).into_response(),
-        Ok(false) => (
+        Ok(Grant::Granted) => (StatusCode::CREATED, Json(transfer.to_ack())).into_response(),
+        Ok(Grant::OtherAssignee) => forbidden(
+            &transfer.provider_pid,
+            "the contract agreement was granted to another participant",
+        ),
+        Ok(Grant::NoAgreement) => (
             StatusCode::BAD_REQUEST,
             Json(TransferErrorMessage::new(
                 Some(transfer.provider_pid.clone()),
@@ -126,56 +167,73 @@ pub async fn initiate_transfer(
 /// `POST {dsp}/transfers/:providerPid/start`.
 pub async fn start_transfer(
     State(state): State<Arc<AppState>>,
+    Extension(participant): Extension<Participant>,
     Path(provider_pid): Path<String>,
     Json(_msg): Json<TransferStartMessage>,
 ) -> impl IntoResponse {
-    transition(&state, &provider_pid, TransferState::Started).await
+    transition(&state, participant, &provider_pid, TransferState::Started).await
 }
 
 /// `POST {dsp}/transfers/:providerPid/completion`.
 pub async fn complete_transfer(
     State(state): State<Arc<AppState>>,
+    Extension(participant): Extension<Participant>,
     Path(provider_pid): Path<String>,
     Json(_msg): Json<TransferCompletionMessage>,
 ) -> impl IntoResponse {
-    transition(&state, &provider_pid, TransferState::Completed).await
+    transition(&state, participant, &provider_pid, TransferState::Completed).await
 }
 
 /// `POST {dsp}/transfers/:providerPid/termination`.
 pub async fn terminate_transfer(
     State(state): State<Arc<AppState>>,
+    Extension(participant): Extension<Participant>,
     Path(provider_pid): Path<String>,
     Json(_msg): Json<TransferTerminationMessage>,
 ) -> impl IntoResponse {
-    transition(&state, &provider_pid, TransferState::Terminated).await
+    transition(
+        &state,
+        participant,
+        &provider_pid,
+        TransferState::Terminated,
+    )
+    .await
 }
 
 /// `POST {dsp}/transfers/:providerPid/suspension`.
 pub async fn suspend_transfer(
     State(state): State<Arc<AppState>>,
+    Extension(participant): Extension<Participant>,
     Path(provider_pid): Path<String>,
     Json(_msg): Json<TransferSuspensionMessage>,
 ) -> impl IntoResponse {
-    transition(&state, &provider_pid, TransferState::Suspended).await
+    transition(&state, participant, &provider_pid, TransferState::Suspended).await
 }
 
 async fn transition(
     state: &Arc<AppState>,
+    participant: Participant,
     provider_pid: &str,
     to: TransferState,
 ) -> axum::response::Response {
     let pid = provider_pid.to_string();
+    // `Err(None)`: bound to another participant.
     let result = state
         .with_graph(move |g| {
             g.update_transfer(&pid, |t| {
+                if !participant.may_act_on(t.participant_id.as_deref()) {
+                    return Err(None);
+                }
                 let from = t.state;
-                t.transition(to).map_err(|_| (from, t.consumer_pid.clone()))
+                t.transition(to)
+                    .map_err(|_| Some((from, t.consumer_pid.clone())))
             })
         })
         .await;
     match result {
         Ok(Some(Ok(()))) => StatusCode::OK.into_response(),
-        Ok(Some(Err((from, consumer_pid)))) => {
+        Ok(Some(Err(None))) => forbidden(provider_pid, OTHER_PARTICIPANT),
+        Ok(Some(Err(Some((from, consumer_pid))))) => {
             bad_transition(provider_pid, &consumer_pid, from, to).into_response()
         }
         Ok(None) => not_found(provider_pid).into_response(),

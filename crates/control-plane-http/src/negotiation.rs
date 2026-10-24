@@ -7,10 +7,10 @@
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use axum::{Extension, Json};
 use control_plane_core::negotiation::{
     ContractAgreementVerificationMessage, ContractNegotiation, ContractNegotiationError,
     ContractNegotiationEventMessage, ContractNegotiationTerminationMessage, ContractRequestMessage,
@@ -20,6 +20,7 @@ use control_plane_core::negotiation::{
 use control_plane_core::common::Offer;
 use control_plane_graph::GraphError;
 
+use crate::auth::Participant;
 use crate::callback::CallbackError;
 use crate::state::AppState;
 
@@ -168,6 +169,29 @@ fn not_found(provider_pid: &str) -> impl IntoResponse {
     )
 }
 
+/// A 403: the negotiation is bound to another participant. Its
+/// consumerPid is not that caller's to learn, so it is left out.
+fn forbidden(provider_pid: &str) -> axum::response::Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(ContractNegotiationError::new(
+            Some(provider_pid.to_string()),
+            None,
+            "403",
+            "the contract negotiation belongs to another participant",
+        )),
+    )
+        .into_response()
+}
+
+/// Why a message was not applied to a stored negotiation.
+enum Refused {
+    /// Sent by a participant the negotiation is not bound to.
+    Forbidden,
+    /// Not a valid transition from the current state (with its consumerPid).
+    Transition(NegotiationState, String),
+}
+
 fn store_error(
     provider_pid: Option<&str>,
     consumer_pid: Option<&str>,
@@ -190,6 +214,7 @@ fn store_error(
 /// outcome to the HTTP response every state-changing endpoint shares.
 async fn transition(
     state: &AppState,
+    participant: Participant,
     provider_pid: &str,
     to: NegotiationState,
 ) -> axum::response::Response {
@@ -197,14 +222,19 @@ async fn transition(
     let result = state
         .with_graph(move |g| {
             g.update_negotiation(&pid, |n| {
+                if !participant.may_act_on(n.participant_id.as_deref()) {
+                    return Err(Refused::Forbidden);
+                }
                 let from = n.state;
-                n.transition(to).map_err(|_| (from, n.consumer_pid.clone()))
+                n.transition(to)
+                    .map_err(|_| Refused::Transition(from, n.consumer_pid.clone()))
             })
         })
         .await;
     match result {
         Ok(Some(Ok(()))) => StatusCode::OK.into_response(),
-        Ok(Some(Err((from, consumer_pid)))) => {
+        Ok(Some(Err(Refused::Forbidden))) => forbidden(provider_pid),
+        Ok(Some(Err(Refused::Transition(from, consumer_pid)))) => {
             bad_transition(provider_pid, &consumer_pid, from, to).into_response()
         }
         Ok(None) => not_found(provider_pid).into_response(),
@@ -232,10 +262,14 @@ fn bad_transition(
 /// `GET {dsp}/negotiations/:providerPid`.
 pub async fn get_negotiation(
     State(state): State<Arc<AppState>>,
+    Extension(participant): Extension<Participant>,
     Path(provider_pid): Path<String>,
 ) -> impl IntoResponse {
     let lookup = provider_pid.clone();
     match state.with_graph(move |g| g.negotiation(&lookup)).await {
+        Ok(Some(n)) if !participant.may_act_on(n.participant_id.as_deref()) => {
+            forbidden(&provider_pid)
+        }
         Ok(Some(n)) => (StatusCode::OK, Json(n.to_ack())).into_response(),
         Ok(None) => not_found(&provider_pid).into_response(),
         Err(e) => store_error(Some(&provider_pid), None, e),
@@ -252,6 +286,7 @@ pub async fn get_negotiation(
 /// Provider then agrees on its own ([`agree`]).
 pub async fn initiate_negotiation(
     State(state): State<Arc<AppState>>,
+    Extension(participant): Extension<Participant>,
     Json(msg): Json<InboundRequest>,
 ) -> impl IntoResponse {
     let InboundRequest {
@@ -273,6 +308,7 @@ pub async fn initiate_negotiation(
     negotiation.dataset_id = msg.offer.target.clone();
     negotiation.offer = Some(msg.offer);
     negotiation.callback_address = msg.callback_address;
+    negotiation.participant_id = participant.0;
     let stored = negotiation.clone();
     match state.with_graph(move |g| g.put_negotiation(&stored)).await {
         Ok(()) => {
@@ -300,6 +336,7 @@ pub async fn initiate_negotiation(
 /// practice every counter-request is refused.
 pub async fn continue_negotiation(
     State(state): State<Arc<AppState>>,
+    Extension(participant): Extension<Participant>,
     Path(provider_pid): Path<String>,
     Json(msg): Json<InboundRequest>,
 ) -> impl IntoResponse {
@@ -314,9 +351,12 @@ pub async fn continue_negotiation(
     let result = state
         .with_graph(move |g| {
             g.update_negotiation(&pid, |n| {
+                if !participant.may_act_on(n.participant_id.as_deref()) {
+                    return Err(Refused::Forbidden);
+                }
                 let from = n.state;
                 n.transition(NegotiationState::Requested)
-                    .map_err(|_| (from, n.consumer_pid.clone()))?;
+                    .map_err(|_| Refused::Transition(from, n.consumer_pid.clone()))?;
                 if msg.offer.target.is_some() {
                     n.dataset_id = msg.offer.target.clone();
                 }
@@ -327,7 +367,8 @@ pub async fn continue_negotiation(
         .await;
     match result {
         Ok(Some(Ok(()))) => StatusCode::OK.into_response(),
-        Ok(Some(Err((from, consumer_pid)))) => bad_transition(
+        Ok(Some(Err(Refused::Forbidden))) => forbidden(&provider_pid),
+        Ok(Some(Err(Refused::Transition(from, consumer_pid)))) => bad_transition(
             &provider_pid,
             &consumer_pid,
             from,
@@ -344,12 +385,16 @@ pub async fn continue_negotiation(
 /// Consumer to send `FINALIZED` to a Provider.
 pub async fn negotiation_event(
     State(state): State<Arc<AppState>>,
+    Extension(participant): Extension<Participant>,
     Path(provider_pid): Path<String>,
     Json(msg): Json<ContractNegotiationEventMessage>,
 ) -> impl IntoResponse {
     if msg.event_type != NegotiationEventType::Accepted {
         let lookup = provider_pid.clone();
         let consumer_pid = match state.with_graph(move |g| g.negotiation(&lookup)).await {
+            Ok(Some(n)) if !participant.may_act_on(n.participant_id.as_deref()) => {
+                return forbidden(&provider_pid);
+            }
             Ok(Some(n)) => n.consumer_pid,
             Ok(None) => return not_found(&provider_pid).into_response(),
             Err(e) => return store_error(Some(&provider_pid), None, e),
@@ -365,7 +410,13 @@ pub async fn negotiation_event(
         )
             .into_response();
     }
-    let response = transition(&state, &provider_pid, NegotiationState::Accepted).await;
+    let response = transition(
+        &state,
+        participant,
+        &provider_pid,
+        NegotiationState::Accepted,
+    )
+    .await;
     if response.status() == StatusCode::OK {
         tokio::spawn(agree(Arc::downgrade(&state), provider_pid));
     }
@@ -397,10 +448,13 @@ pub async fn agree(state: Weak<AppState>, provider_pid: String) {
                 .callback_address
                 .clone()
                 .ok_or_else(|| "no callbackAddress to send the agreement to".to_string())?;
-            // Without DCP the Consumer has no verified participant id
-            // yet; its consumerPid is the only name this Provider has
-            // for it.
-            let assignee = n.consumer_pid.clone();
+            // The participant DCP authenticated; with DCP off the
+            // Consumer has no verified participant id, and its
+            // consumerPid is the only name this Provider has for it.
+            let assignee = n
+                .participant_id
+                .clone()
+                .unwrap_or_else(|| n.consumer_pid.clone());
             let id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
             let agreement = n
                 .agree(id, assigner, assignee, chrono::Utc::now())
@@ -596,6 +650,7 @@ pub async fn finalize(state: Weak<AppState>, provider_pid: String) {
 /// already `FINALIZED` is left as it is.
 pub async fn verify_agreement(
     State(state): State<Arc<AppState>>,
+    Extension(participant): Extension<Participant>,
     Path(provider_pid): Path<String>,
     Json(_msg): Json<ContractAgreementVerificationMessage>,
 ) -> impl IntoResponse {
@@ -604,6 +659,9 @@ pub async fn verify_agreement(
     let result = state
         .with_graph(move |g| {
             g.update_negotiation(&pid, |n| {
+                if !participant.may_act_on(n.participant_id.as_deref()) {
+                    return Err(Some(Refused::Forbidden));
+                }
                 let from = n.state;
                 if matches!(
                     from,
@@ -612,7 +670,7 @@ pub async fn verify_agreement(
                     return Err(None);
                 }
                 n.transition(NegotiationState::Verified)
-                    .map_err(|_| Some((from, n.consumer_pid.clone())))
+                    .map_err(|_| Some(Refused::Transition(from, n.consumer_pid.clone())))
             })
         })
         .await;
@@ -622,7 +680,8 @@ pub async fn verify_agreement(
             tokio::spawn(finalize(Arc::downgrade(&state), provider_pid));
             StatusCode::OK.into_response()
         }
-        Ok(Some(Err(Some((from, consumer_pid))))) => bad_transition(
+        Ok(Some(Err(Some(Refused::Forbidden)))) => forbidden(&provider_pid),
+        Ok(Some(Err(Some(Refused::Transition(from, consumer_pid))))) => bad_transition(
             &provider_pid,
             &consumer_pid,
             from,
@@ -678,6 +737,7 @@ pub async fn resume(state: &Arc<AppState>) {
 /// ([`agree`]), and the Consumer may not have heard of that yet.
 pub async fn terminate_negotiation(
     State(state): State<Arc<AppState>>,
+    Extension(participant): Extension<Participant>,
     Path(provider_pid): Path<String>,
     Json(_msg): Json<ContractNegotiationTerminationMessage>,
 ) -> impl IntoResponse {
@@ -688,18 +748,22 @@ pub async fn terminate_negotiation(
     let result = state
         .with_graph(move |g| {
             g.update_negotiation(&pid, |n| {
+                if !participant.may_act_on(n.participant_id.as_deref()) {
+                    return Err(Some(Refused::Forbidden));
+                }
                 let from = n.state;
                 if from == NegotiationState::Terminated {
                     return Err(None);
                 }
                 n.transition(NegotiationState::Terminated)
-                    .map_err(|_| Some((from, n.consumer_pid.clone())))
+                    .map_err(|_| Some(Refused::Transition(from, n.consumer_pid.clone())))
             })
         })
         .await;
     match result {
         Ok(Some(Ok(()) | Err(None))) => StatusCode::OK.into_response(),
-        Ok(Some(Err(Some((from, consumer_pid))))) => bad_transition(
+        Ok(Some(Err(Some(Refused::Forbidden)))) => forbidden(&provider_pid),
+        Ok(Some(Err(Some(Refused::Transition(from, consumer_pid))))) => bad_transition(
             &provider_pid,
             &consumer_pid,
             from,

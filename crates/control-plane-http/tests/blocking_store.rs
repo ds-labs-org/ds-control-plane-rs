@@ -13,7 +13,7 @@ use axum::routing::{get, post};
 use control_plane_core::negotiation::ContractNegotiation;
 use control_plane_http::config::Config;
 use control_plane_http::state::AppState;
-use control_plane_http::{metadata, negotiation};
+use control_plane_http::{auth, metadata, negotiation};
 use tower::ServiceExt;
 
 const DSP: &str = "/dsp/2025-1";
@@ -29,6 +29,12 @@ fn router(state: Arc<AppState>) -> Router {
             &format!("{DSP}/negotiations/request"),
             post(negotiation::initiate_negotiation),
         )
+        // Handlers take the participant this layer authenticates (with
+        // DCP off, `Participant(None)`).
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::authenticate,
+        ))
         .with_state(state)
 }
 
