@@ -25,7 +25,11 @@ const DSP: &str = "/dsp/2025-1";
 const MEMBERSHIP: &str = "MembershipCredential";
 
 fn did_at(addr: SocketAddr, path: &str) -> String {
-    format!("did:web:127.0.0.1%3A{}:{path}", addr.port())
+    did_on("127.0.0.1", addr, path)
+}
+
+fn did_on(host: &str, addr: SocketAddr, path: &str) -> String {
+    format!("did:web:{host}%3A{}:{path}", addr.port())
 }
 
 async fn listen() -> (tokio::net::TcpListener, SocketAddr) {
@@ -96,10 +100,16 @@ struct Consumer {
 
 impl Consumer {
     async fn start() -> Self {
+        Self::start_on("127.0.0.1").await
+    }
+
+    /// A consumer whose DID and Credential Service name `host`, which
+    /// must resolve to loopback.
+    async fn start_on(host: &str) -> Self {
         let (listener, addr) = listen().await;
         let consumer = Self {
-            key: DcpKeyPair::generate(did_at(addr, "consumer")),
-            base: format!("http://{addr}"),
+            key: DcpKeyPair::generate(did_on(host, addr, "consumer")),
+            base: format!("http://{host}:{}", addr.port()),
             credentials: Arc::default(),
             queries: Arc::default(),
             callbacks: Arc::default(),
@@ -172,10 +182,10 @@ impl Consumer {
 }
 
 async fn consumer_did(State(c): State<Consumer>) -> Json<Value> {
-    Json(c.key.did_document(&[(
-        "CredentialService".to_string(),
-        format!("{}/cs", c.base),
-    )]))
+    Json(
+        c.key
+            .did_document(&[("CredentialService".to_string(), format!("{}/cs", c.base))]),
+    )
 }
 
 async fn callback(
@@ -446,10 +456,7 @@ async fn wait_for_callbacks(consumer: &Consumer, n: usize) -> Vec<(String, Optio
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    panic!(
-        "expected {n} callbacks, got {:?}",
-        consumer.callbacks()
-    );
+    panic!("expected {n} callbacks, got {:?}", consumer.callbacks());
 }
 
 // ---- authentication ----
@@ -460,7 +467,12 @@ async fn every_dsp_endpoint_needs_a_token_and_answers_with_its_own_error() {
     let cp = ControlPlane::start(&[&issuer]).await;
 
     let (status, body) = cp
-        .call("POST", &format!("{DSP}/catalog/request"), None, Some(catalog_request()))
+        .call(
+            "POST",
+            &format!("{DSP}/catalog/request"),
+            None,
+            Some(catalog_request()),
+        )
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(body["@type"], "CatalogError");
@@ -489,7 +501,12 @@ async fn every_dsp_endpoint_needs_a_token_and_answers_with_its_own_error() {
     assert!(body["providerPid"].is_string());
 
     let (status, body) = cp
-        .call("GET", &format!("{DSP}/negotiations/urn:uuid:p1"), None, None)
+        .call(
+            "GET",
+            &format!("{DSP}/negotiations/urn:uuid:p1"),
+            None,
+            None,
+        )
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(body["@type"], "ContractNegotiationError");
@@ -507,7 +524,12 @@ async fn every_dsp_endpoint_needs_a_token_and_answers_with_its_own_error() {
     assert_eq!(body["@type"], "TransferError");
 
     let (status, body) = cp
-        .call("POST", &format!("{DSP}/transfers/urn:uuid:t1/start"), None, Some(json!({})))
+        .call(
+            "POST",
+            &format!("{DSP}/transfers/urn:uuid:t1/start"),
+            None,
+            Some(json!({})),
+        )
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(body["@type"], "TransferError");
@@ -518,7 +540,9 @@ async fn every_dsp_endpoint_needs_a_token_and_answers_with_its_own_error() {
 async fn the_version_endpoint_and_the_did_document_need_no_token() {
     let issuer = Issuer::start().await;
     let cp = ControlPlane::start(&[&issuer]).await;
-    let (status, _) = cp.call("GET", "/.well-known/dspace-version", None, None).await;
+    let (status, _) = cp
+        .call("GET", "/.well-known/dspace-version", None, None)
+        .await;
     assert_eq!(status, StatusCode::OK);
     let (status, doc) = cp.call("GET", "/cp/did.json", None, None).await;
     assert_eq!(status, StatusCode::OK);
@@ -533,7 +557,12 @@ async fn a_member_reads_the_catalog() {
     let cp = ControlPlane::start(&[&issuer]).await;
     let consumer = Consumer::with_credential(&issuer, MEMBERSHIP).await;
     let (status, body) = cp
-        .dsp(&consumer, "POST", "/catalog/request", Some(catalog_request()))
+        .dsp(
+            &consumer,
+            "POST",
+            "/catalog/request",
+            Some(catalog_request()),
+        )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["@type"], "Catalog");
@@ -646,15 +675,35 @@ async fn a_credential_for_another_subject_is_401() {
     assert_refused(&cp, &consumer.token(&cp.did)).await;
 }
 
+/// The issuer runs on 127.0.0.1, which trusting it allows; the consumer
+/// runs on `localhost`, allowed only when listed.
 #[tokio::test]
 async fn a_participant_outside_the_allow_list_is_401() {
     let issuer = Issuer::start().await;
+    let consumer = Consumer::start_on("localhost").await;
+    let vc = issuer.issue(consumer.did(), MEMBERSHIP);
+    consumer.credentials.lock().unwrap().push(vc);
+
     let cp = ControlPlane::start_with(&[&issuer], |config| {
         config.dcp.as_mut().unwrap().allowed_hosts = vec!["example.com".to_string()];
     })
     .await;
-    let consumer = Consumer::with_credential(&issuer, MEMBERSHIP).await;
     assert_refused(&cp, &consumer.token(&cp.did)).await;
+    assert!(consumer.queries.lock().unwrap().is_empty());
+
+    let cp = ControlPlane::start_with(&[&issuer], |config| {
+        config.dcp.as_mut().unwrap().allowed_hosts = vec!["localhost".to_string()];
+    })
+    .await;
+    let (status, body) = cp
+        .dsp(
+            &consumer,
+            "POST",
+            "/catalog/request",
+            Some(catalog_request()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 #[tokio::test]

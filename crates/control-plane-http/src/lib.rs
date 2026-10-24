@@ -7,6 +7,7 @@
 //! See `../../ARCHITECTURE.md` for what this bootstrap implements,
 //! stubs, and leaves out of scope.
 
+pub mod auth;
 pub mod callback;
 pub mod catalog;
 pub mod config;
@@ -20,6 +21,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
+use axum::{Json, middleware};
 
 use control_plane_graph::ControlPlaneGraph;
 
@@ -49,6 +51,18 @@ pub struct App {
 /// particular — can read back the OS-assigned port via
 /// `TcpListener::local_addr()` when `config.port == 0`.
 pub async fn build(config: Config) -> anyhow::Result<App> {
+    let addr = format!("0.0.0.0:{}", config.port);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    build_with_listener(config, listener).await
+}
+
+/// [`build`] on an already bound `listener` (`config.port` is then
+/// unused): a caller that needs the address before the app exists, e.g.
+/// for a `did:web` DID naming its port, binds first.
+pub async fn build_with_listener(
+    config: Config,
+    listener: tokio::net::TcpListener,
+) -> anyhow::Result<App> {
     let dsp = &config.dsp_path;
     let state = Arc::new(AppState::open(config.clone())?);
     // Counts by type only: decoding every record here would make startup
@@ -68,11 +82,7 @@ pub async fn build(config: Config) -> anyhow::Result<App> {
     negotiation::resume(&state).await;
 
     let graph = state.graph.clone();
-    let router = Router::new()
-        .route(
-            "/.well-known/dspace-version",
-            get(metadata::well_known_version),
-        )
+    let dsp_routes = Router::new()
         .route(
             &format!("{dsp}/catalog/request"),
             post(catalog::catalog_request),
@@ -129,11 +139,38 @@ pub async fn build(config: Config) -> anyhow::Result<App> {
             &format!("{dsp}/transfers/{{provider_pid}}/suspension"),
             post(transfer::suspend_transfer),
         )
+        // Authenticates before any body is read; see `auth`.
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::authenticate,
+        ));
+    let mut public_routes = Router::new().route(
+        "/.well-known/dspace-version",
+        get(metadata::well_known_version),
+    );
+    match &state.dcp {
+        Some(dcp) => {
+            // The path this connector's did:web resolves to.
+            let path = control_plane_dcp::did_web_path(dcp.did())
+                .map_err(|e| anyhow::anyhow!("DCP_DID: {e}"))?;
+            let document = dcp.identity().did_document();
+            tracing::info!(did = %dcp.did(), %path, "DCP authentication on: serving the DID document");
+            public_routes = public_routes.route(
+                &path,
+                get(move || {
+                    let document = document.clone();
+                    async move { Json(document) }
+                }),
+            );
+        }
+        None => tracing::warn!(
+            "DCP is not configured (no DCP_DID): the DSP catalog, negotiation and transfer endpoints are UNAUTHENTICATED"
+        ),
+    }
+    let router = public_routes
+        .merge(dsp_routes)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state);
-
-    let addr = format!("0.0.0.0:{}", config.port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
 
     Ok(App {
         listener,

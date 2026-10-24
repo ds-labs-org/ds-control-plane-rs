@@ -11,12 +11,13 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let config = Config::from_env();
+    let config = Config::from_env()?;
     tracing::info!(
         port = config.port,
         base_url = %config.base_url,
         dsp_base_url = %config.dsp_base_url(),
         agent_id = %config.agent_id,
+        dcp_did = config.dcp.as_ref().map(|d| d.did.as_str()).unwrap_or("(off)"),
         "starting ds-control-plane-rs"
     );
 
