@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 control-plane-core = { path = "../control-plane-core" }
 control-plane-graph = { path = "../control-plane-graph" }
+control-plane-dcp = { path = "../control-plane-dcp" }
 axum = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -25,9 +26,12 @@ chrono = { workspace = true }
 anyhow = { workspace = true }
 # Sends the Provider's own negotiation messages to the Consumer's
 # callbackAddress (src/callback.rs).
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { workspace = true }
 
 [dev-dependencies]
+# tests/dcp_auth.rs plays the Consumer, its Credential Service and the
+# issuers with the same DCP primitives the verifier uses.
+ds-dcp-core-rs = { workspace = true }
 tempfile = "3"
 # tests/connector.rs drives the Contreforts connector over the running
 # app's own graph.
